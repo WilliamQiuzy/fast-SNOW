@@ -1,0 +1,1 @@
+"""Fast-SNOW package root."""

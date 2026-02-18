@@ -1,0 +1,44 @@
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Python cache / tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environments
+.venv/
+venv/
+env/
+.venv_mapanything/
+
+# Runtime outputs
+results/
+outputs/
+logs/
+
+# Local data / checkpoints
+fast_snow/models/
+fast_snow/data/vlm4d_videos/
+fast_snow/data/VLM4D-main/
+
+# Backward-compatible old paths (if present)
+data/models/
+data/vlm4d_videos/
+
+# Local agent settings
+.claude/
+
+# Optional local clones/cache (if users place extra repos)
+fast_snow/vision/third_party/
+
+# Cloned model repos (pull via bootstrap script)
+fast_snow/vision/sam3/
+fast_snow/vision/da3/
+fast_snow/vision/recognize-anything/
+fast_snow/data/MapAnything/

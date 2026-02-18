@@ -1,0 +1,1277 @@
+
+
+--- Page 1 ---
+SNOW: Spatio-Temporal Scene Understanding with World Knowledge for
+Open-World Embodied Reasoning
+Tin Stribor Sohn1,3†∗Maximilian Dillitzer2,3∗Jason J. Corso4,5Eric Sax1
+1Karlsruhe Institute of Technology2Esslingen University of Applied Sciences
+3Dr. Ing. h.c. F. Porsche AG4University of Michigan5V oxel51 Inc.
+tinstribor.sohn@porsche.de
+Figure 1.Overview of SNOW.SNOW builds a unified 4D Scene Graph (4DSG) by merging VLM semantics with 3D geometry and
+temporal continuity. STEP tokens encode object-level semantic, spatial, and temporal attributes into a persistent representation that enables
+grounded reasoning across diverse 4D benchmarks without additional training.
+Abstract
+Autonomous robotic systems require spatio-temporal un-
+derstanding of dynamic environments to ensure reliable
+navigation and interaction. While Vision-Language Mod-
+els (VLMs) provide open-world semantic priors, they lack
+grounding in 3D geometry and temporal dynamics. Con-
+versely, geometric perception captures structure and motion
+but remains semantically sparse. We proposeSNOW(Scene
+Understanding with Open-World Knowledge), a training-
+free and backbone-agnostic framework for unified 4D scene
+understanding that integrates VLM-derived semantics with
+point cloud geometry and temporal consistency. SNOW
+processes synchronized RGB images and 3D point clouds,
+using HDBSCAN clustering to generate object-level pro-
+posals that guide SAM2-based segmentation. Each seg-
+mented region is encoded through our proposedSpatio-
+*Equal contribution;†Corresponding author.Temporal Tokenized Patch Encoding (STEP), producing
+multimodal tokens that capture localized semantic, geomet-
+ric, and temporal attributes. These tokens are incrementally
+integrated into a4D Scene Graph (4DSG), which serves as
+4D prior for downstream reasoning. A lightweight SLAM
+backend anchors all STEP tokens spatially in the environ-
+ment, providing the global reference alignment, and en-
+suring unambiguous spatial grounding across time. The
+resulting 4DSG forms a queryable, unified world model
+through which VLMs can directly interpret spatial scene
+structure and temporal dynamics. Experiments on a diverse
+set of benchmarks demonstrate that SNOW enables precise
+4D scene understanding and spatially grounded inference,
+thereby setting new state-of-the-art performance in several
+settings, highlighting the importance of structured 4D pri-
+ors for embodied reasoning and autonomous robotics.
+1arXiv:2512.16461v1  [cs.CV]  18 Dec 2025
+
+
+--- Page 2 ---
+1. Introduction
+Robotic systems operating in unstructured, dynamic envi-
+ronments must reason not only about which objects are
+present, but also how they are situated in 3D space and how
+they evolve over time. This requires the integration of open-
+world semantics with geometrically precise and temporally
+coherent scene representations [42]. Existing approaches
+expose a fundamental disconnect: Vision-Language Models
+(VLMs), relying on tokenized image patches, provide rich
+semantic priors and general world knowledge [18, 34, 50],
+yet their reasoning remains weakly grounded in spatial ge-
+ometry and temporal continuity [4, 40, 45, 47, 54]. Con-
+versely, geometric perception systems capture structure and
+motion, but are limited in semantic expressiveness and
+open-vocabulary flexibility. A unified 4D representation
+within VLMs is therefore required to connect semantic ab-
+straction with persistent spatial and temporal grounding.
+To address this challenge, we introduceSNOW(Scene
+Understanding withOpen-World Knowledge), atraining-
+freeframework that constructs a structured 4D representa-
+tion from synchronized RGB images and point cloud ob-
+servations. Consecutive point clouds are grouped via HDB-
+SCAN clustering [1] to form object-level proposals, which
+guide SAM2 [41] in targeted segmentation. Through cali-
+brated projection and fusion, each segmented region is as-
+sociated with its geometric shape and temporal identity.
+We encode each object-level region using our newSpatio-
+Temporal Tokenized Patch Encoding (STEP), a com-
+pact multimodal token representation capturing localized
+semantics, geometry, and time.
+Accumulating STEP tokens across frames yields a struc-
+tured4D Scene Graph (4DSG), where object entities are
+persistently indexed spatio-temporally by a SLAM back-
+end [13, 22]. The 4DSG provides a queryable 4D prior:
+VLMs can infer on spatially grounded semantics and tem-
+porally coherent object tracks, without fine-tuning or ar-
+chitectural modification. This representation enables long-
+horizon reasoning, stable scene interpretation under motion,
+and consistent integration of new observations.
+The contributions of this work are as follows:
+• We proposeSNOW, a training-free framework that fuses
+open-world semantic priors from VLMs with temporally
+consistent 3D perception for 4D scene understanding.
+• We introduceSTEP encoding, a multimodal object-level
+tokenization scheme that jointly encodes semantic, geo-
+metric, and temporal information.
+• We construct a persistent4DSGthat serves as a structured
+and queryable spatio-temporal representation through
+which VLMs can perform grounded reasoning in 4D.
+• We demonstrate that structured 4D priors substantially
+improve spatial grounding, temporal coherence, and
+open-vocabulary scene understanding, achieving new
+state-of-the-art results on multiple benchmarks.By linking semantic world knowledge of VLMs to explicit
+4D structure, SNOW establishes a general foundation for
+grounded reasoning in autonomous and embodied systems.
+All code will be open sourced upon publication.
+2. Related Work
+Recent advances in VLMs demonstrate strong progress in
+semantic reasoning and language-guided interaction [5, 6].
+However, spatial and temporal reasoning capabilities re-
+main comparatively underdeveloped [4, 40, 45, 47]. Spatial
+reasoning is critical for localization and relational ground-
+ing, yet most VLMs either rely on compressed image em-
+beddings or approximate geometric priors [16, 17, 35].
+Temporal reasoning, on the other hand, is often reduced to
+frame-level extensions of image models, where sequential
+dependencies are captured without maintaining explicit spa-
+tial structure [25, 26, 28]. As a result, existing approaches
+struggle to jointly represent evolving 3D environments in a
+manner that is consistent across both space and time.
+2.1. Spatial Grounding and Representations
+Consider this broad grouping of spatial extensions: im-
+age, point cloud, and hybrid modality-based methods [53].
+Image-based approaches leverage multi-view reconstruc-
+tion, depth estimation, or Bird’s-Eye-View abstractions to
+approximate 3D structure [8, 21, 48, 59, 61]. While effec-
+tive in controlled or dense settings, they often depend on
+specialized training and pre-aligned feature spaces. Point-
+based reasoning directly incorporates 3D geometry, either
+through projection into 2D depth maps [55, 62] or with ded-
+icated 3D encoders [3, 7, 38, 60]. Such methods can achieve
+fine-grained localization, but typically require multi-stage
+retraining and are bound to specific modalities. Hybrid de-
+signs combine images and point clouds to balance semantic
+richness with metric fidelity [14, 19, 29, 58], yet this again
+couples performance to tailored data pipelines and trained
+backbone models.
+2.2. Temporal Grounding and Representations
+Temporal extensions have followed a similar trend. Early
+work uniformly samples video frames and feeds them
+into pretrained image-language backbones [25, 28, 33],
+while more advanced models introduce temporal-aware em-
+beddings or memory mechanisms to capture longer se-
+quences [15, 27, 31]. These approaches improve event lo-
+calization and activity recognition but treat videos as 2D
+temporal streams, neglecting the underlying 3D geometry.
+Consequently, temporal understanding remains largely de-
+coupled from spatial reasoning.
+2.3. Spatio-Temporal Grounding
+Spatio-temporal grounding attempts to bridge this gap by
+jointly modeling objects in space and time. Classical
+2
+
+
+--- Page 3 ---
+computer vision pipelines detect and track spatio-temporal
+tubes [44, 51, 56], while recent VLM-based variants incor-
+porate temporal encoding into spatial features [24, 36, 46].
+Although these methods demonstrate progress towards dy-
+namic scene understanding, all require task-specific training
+and remain dependent on fixed backbones.
+2.4. Gap Towards Unified, Training-free Spatio-
+Temporal Understanding
+Overall, existing approaches are limited by three factors:
+(i) reliance on extensive training to align modalities, (ii) de-
+pendence on specific backbone architectures and model
+sizes, and (iii) a lack of explicit geometry when extend-
+ing into the temporal domain. In particular, alignment-
+based strategies often sacrifice generalization across modal-
+ities and datasets, since optimization is tailored to specific
+sensory inputs and task settings. This motivates training-
+free and backbone-agnostic methods that maintain gener-
+ality, while remaining adaptable to different downstream
+VLMs. Such approaches must also support diverse point
+cloud sources (e.g., LiDAR, radar, and RGB-D scans) and
+preserve spatio-temporal consistency without retraining.
+3. Method
+Robotic perception requires the integration of semantic
+richness, geometric precision, and temporal consistency.
+While point clouds provide accurate 3D structure, they
+are semantically sparse. Conversely, VLMs offer open-
+vocabulary semantics but lack grounding in metric space
+and temporal reasoning. To bridge this gap, we propose
+SNOW, atraining-freeandbackbone-agnosticmethod for
+4D spatio-temporal scene understanding. SNOW operates
+on synchronized RGB images and point clouds obtained
+from LiDAR sensors or monocular visual reconstructions
+via MapAnything [22]. All sensors are assumed to be tem-
+porally aligned and geometrically calibrated. The approach
+leverages 3D point clouds to guide SAM2-based segmen-
+tation [41], enforces cross-view and temporal consistency,
+and organizes all observations into a tokenized 4DSG that
+serves as a persistent 4D prior to VLMs (cf. Figure 2). A
+SLAM backend [13, 22] is used for maintaining a globally
+consistent reference frame, ensuring unambiguous spatial
+alignment. On a single NVIDIA H100 GPU, the pipeline
+processes about 1.1 frames per second (cf. Appendix 10),
+enabling high-fidelity scene representation in 4D for VLM-
+based interpretation, scene understanding (i.e., VQA), and
+downstream tasks such as point cloud segmentation.
+3.1. Point Cloud Clustering and Sampling
+Given an input point cloud at timet,Pt={pt
+i}N
+i=1with
+eachpt
+i∈R3, we initialize the set of unmapped points
+asUt←Pt. We clusterUtin metric space using HDB-
+SCAN [1], which identifies regions of high point densityand prunes unstable clusters, producing a set of data-driven
+spatial clusters:
+Rt={Rt
+1, . . . , Rt
+K}.(1)
+From each clusterRt
+k, we uniformly samplemrepresenta-
+tive pointsVt
+k={vt
+k1, . . . , vt
+km} ⊂Rt
+k, which act as region
+proposals for subsequent mask generation (we usem= 4
+in our experiments).
+3.2. Mask Generation and STEP Encoding
+All points of the input cloudPtare first projected into the
+image plane of camerac:
+(ximg
+i, yimg
+i) =π(pt
+i, It
+c),(2)
+whereπ(·)denotes the perspective projection using camera
+intrinsics and extrinsics. Within the same process, the pro-
+jected region proposals{Vt
+k}imgare used as point prompts
+for SAM2 [41], which returns object masks
+mt
+k,c⊂It
+c.(3)
+Consistency between masks of the same physical object
+across multiple camera views is enforced via Hungarian
+matching [23].
+Next, we associate the points from the 3D point cloud
+with their corresponding masks in image space. Each 3D
+point(ximg
+i, yimg
+i)is assigned to maskmt
+k,cif its projection
+lies within the support ofmt
+k,c(i.e.,(ximg
+i, yimg
+i)∈mt
+k,c).
+Each object maskmt
+k,cis passed through our newSpatio-
+Temporal Tokenized Patch Encoding (STEP), which
+compacts semantic, geometric, and temporal information
+into a unified token representation (cf. Figure 3). The pro-
+posed STEP encoding procedure is as follows:
+1. The object maskmt
+k,cis isolated by coloring all in-mask
+pixels.
+2. The masked image is partitioned into a fixed16×16
+grid, yielding 256 patches.
+3. Each grid cell is evaluated by its Intersection-over-Union
+(IoU) with the mask. Cells with IoU>0.5are retained
+asimage patch tokens, denotedτt
+k,1, . . . , τt
+k,m.
+4. To complement the image tokens, four additional feature
+tokens are appended:
+• acentroid tokenct
+k= (¯x,¯y,¯z)encoding the 3D center
+of the object,
+• ashape tokenst
+k= 
+(µa, σa, amin, amax)a∈
+{x, y, z}
+derived from Gaussian distributions and
+spatial extents along each axis, whereµ aandσ ade-
+note the mean and standard deviation, anda min, amax
+capture the axis-aligned boundaries—this represen-
+tation preserves the geometric spread of the object
+without collapsing it into a rectangular bounding box,
+while simultaneously avoiding skew due to Gaussian
+approximation and attenuating the influence of outliers
+through the statistical formulation,
+3
+
+
+--- Page 4 ---
+Figure 2.High-level pipeline of SNOW.The method clusters point clouds, samples representative points, and employs them as point
+prompts for SAM2-based segmentation. The resulting STEP tokens form a unified spatio-temporal scene graph (i.e., 4DSG), which serves
+as a persistent 4D world model, queryable by VLMs.
+• a pair oftemporal tokensθt
+k= (t start, tend)encoding
+the time of first appearance and disappearance of the
+object.
+The complete token set for objectkat timetis therefore
+St
+k={τt
+k,1, . . . , τt
+k,m, ct
+k, st
+k, θt
+k}.(4)
+These STEP tokens jointly capture semantic appearance
+(image patches), geometric structure over the whole scene
+layout (centroid and shape), and temporal context (ap-
+pearance and disappearance), forming the atomic building
+blocks of the 4DSG. These feature tokens jointly capture
+the necessary information for downstream reasoning tasks
+in 4D, while remaining compact.
+After STEP encoding, the unmapped point setUtis up-
+dated and reprocessed for up toN iteriterations. In each it-
+eration, residual points are reintroduced into SAM2 for re-
+fined mask generation, incrementally integrating previously
+unassigned structures into the STEP token space. To en-
+hance global consistency, anH hop-step reasoning procedure
+operates on the tokenized representations, detecting implau-
+sible geometries (e.g., elongated Gaussians such as a50 m
+car roof) and reassigning them toUt(cf. Table 1). These
+points are reintegrated into the refinement loop, prevent-
+ing error accumulation and preserving a consistent spatio-
+temporal representation.
+3.3. 4D Scene Graph Construction
+At each time stept, SNOW constructs a spatial scene graph
+Gt= (Vt,Et),(5)
+where each nodevt
+k∈ Vtcorresponds to a STEP-token set
+St
+krepresenting a localized object instance, and edgesEt
+encode spatial relations derived from geometric proximityand relative orientation. This per-frame graph captures the
+semantic and geometric structure of the scene at a single
+timestamp.
+Spatio-Temporal Association.To model temporal evo-
+lution, spatial scene graphs are aggregated over a sliding
+window ofTframes,
+Gt−T:t={Gt−T, . . . ,Gt}.(6)
+Each detected object instancekis associated across frames
+by using semantic and 3D spatial cues derived from the en-
+riched cluster representation in a STEP token setSt
+k. This
+yields a temporally coherent sequence of STEP tokens for
+each object
+Fk={St−T
+k, . . . , St
+k},(7)
+which jointly captures semantic identity, geometric extent,
+and motion-consistent state progression. Newly observed
+instances detected inUtare initialized with fresh STEP
+tokens, while disappeared ones are terminated by mark-
+ing their final timestampθt
+k. Temporal continuity is there-
+fore encoded directly at the token level, without recurrent
+state or explicit tracking heuristics. The resulting sequences
+{Fk}form the node-level temporal representation used in
+the 4DSG.
+4D Scene Graph.Aggregating the temporally aligned
+graphs yields the unified 4DSG
+Mt= 
+Gt−T:t,{St−T:t
+k}
+,(8)
+where each object node is represented by a STEP-token se-
+quence encoding semantic attributes, geometric extent, and
+temporal evolution. To ensure consistent spatial alignment
+4
+
+
+--- Page 5 ---
+Figure 3.STEP token assignment process.Masks with at least 50% IoU containment retain their image tokens, which are enriched with
+3D centroid, Gaussian shape, and extent tokens, as well as two temporal appearance and disappearance tokens. The resulting STEP tokens
+are assembled into a 4DSG, serving as SNOW’s persistent 4D prior.
+across frames,Mtis anchored in a globally referenced co-
+ordinate system using a SLAM backend: KISS-SLAM [13]
+for LiDAR input and MapAnything [22] for image-only in-
+put. Furthermore, this graph is enriched with the pose and
+position of the ego actor to provide information needed for
+self-awareness of the VLM-agent. The resulting 4DSG pro-
+vides a persistent, queryable 4D prior that unifies spatial and
+temporal context for downstream reasoning.
+The window sizeTgoverns the accessible temporal hori-
+zon: increasingTenhances long-range reasoning, while
+decreasingTimproves computational efficiency. We use
+T= 10in our experiments (approximately 10 seconds of
+context), achieving a balanced trade-off between temporal
+grounding and inference efficiency. The parameter can be
+freely adjusted to accommodate different backbone models
+or resource settings. By allowing downstream VLMs to op-
+erate directly on structured object-level tokens rather than
+raw sensory data, the 4DSG enables spatially and tempo-
+rally grounded inference, while remaining training-free.
+3.4. Inference with VLMs
+Inference is performed directly on the unified 4DSGMt,
+which provides object-centered semantic and geometric
+context over the chosen temporal windowT. Given a query
+q, the VLM reasons on the STEP-token sequences associ-
+ated with the nodes ofMt, enabling grounding in both re-
+cent observations and their temporal evolution.
+Formally, we express inference as:
+ˆy=VLM(q| Mt),(9)
+whereMtencodes the spatial layout, semantic attributes,
+and temporal dynamics of all objects within the windowt−
+T:t,qdenotes the user- or task-specific query, andˆyis the
+resulting output.
+Because the 4DSG is already tokenized at the object
+level, inference requires no additional feature pooling orHhopReasoning Refinement Example
+Q:What object moved the most in the last 2 seconds?
+A:Strictly by world-coordinate displacement between
+t= 1andt= 2, object id 32 (pedestrian) moved the
+most: about32.2m (∆x≈+0.13m,∆y≈+32.06
+m,∆z≈ −3.73m). This magnitude is implausible for a
+standing person and the shape/extents changed markedly,
+suggesting an ID switch or association error. Exclud-
+ing that outlier and considering consistent tracks, the next
+largest (and likely true) motion is object id 8 (car), which
+moved about22.4m (∆x≈ −18.61m,∆y≈+12.42
+m,∆z≈ −0.88m) over the2s timestep (≈11.2m/s).
+Table 1.H hopreasoning refinement.Example of hop-based fil-
+tering on the 4DSG, removing implausible motions and geometry
+outliers before answering spatio-temporal queries.
+post-processing. Queries are resolved directly at the ob-
+ject level via STEP-tokens, allowing the VLM to perform
+grounded reasoning over 4D structure. Since the represen-
+tation is training-free and backbone-agnostic, it can be inte-
+grated with different VLM architectures and sensing modal-
+ities (LiDAR, radar, RGB-D), ensuring flexibility across
+robotic domains. The full pipeline of SNOW is summarized
+in Algorithm 1, provided in Appendix 6.
+4. Experiments
+4.1. Experimental Setting
+We evaluate SNOW across four complementary bench-
+marks designed to test semantic, spatial, and temporal un-
+derstanding. NuScenes-QA [39] separately tests spatial
+and temporal scene comprehension in driving scenes, while
+RoboSpatial-Home [43] focuses on spatial understanding
+predominantly. To complement the evaluation setting, we
+5
+
+
+--- Page 6 ---
+Method Ext↑Cnt↑Obj↑Sts↑Cmp↑ Acc↑
+LLaMA-AdapV2 [11] 19.3 2.7 7.6 10.8 1.6 9.6
+LLaV A1.5 [30] 45.8 7.7 7.8 9.0 52.1 26.2
+LiDAR-LLM [52] 74.5 15.0 37.8 45.9 57.8 48.6
+OccLLaMA3.1 [48] 80.9 19.2 46.3 47.8 66.6 54.5
+BEVDet+BUTD [39] 83.7 22.0 48.8 52.0 67.7 57.0
+OpenDriveVLA-0.5B [58] 83.9 22.0 50.2 57.0 68.4 58.4
+OpenDriveVLA-3B [58] 84.0 22.3 50.3 56.9 68.5 58.5
+OpenDriveVLA-7B [58] 84.222.7 49.6 54.568.8 58.2
+SNOW(Ours) 82.327.4 53.2 80.561.0 60.1
+Table 2.NuScenes-QA evaluation.Accuracy (%) scores include
+Existence (Ext), Count (Cnt), Object, (Obj), Status (Sts), Com-
+parison (Cmp), and overall Accuracy (Acc).Boldindicates the
+highest score and underline the second highest score.
+use the VLM4D benchmark [57], which is designed to as-
+sess true 4D understanding of spatial and temporal dynam-
+ics in videos. NuScenes-based LiDAR segmentation [9]
+provides an additional assessment of spatial accuracy and
+temporal consistency on a downstream task. An ablation
+study on VLM4D further isolates the contribution of the in-
+tegration of 4D STEP tokens in the reasoning process. All
+evaluations adhere to the official scoring protocols of the
+respective benchmarks.
+For all experiments, we configure SNOW with a local
+observation window ofT= 10frames for temporal track-
+ing, andN iter= 1andH hop= 1for refinement, which pro-
+vides a balance between efficiency and fidelity. The video
+predictor of SAM2 Hiera Large [41] is employed together
+with Gemma3-4B-IT [12] as the backbone VLM. KISS-
+SLAM [13] serves as the primary SLAM backend, while
+MapAnything [22] is used for experiments that operate ex-
+clusively on image data.
+4.2. Main Results
+NuScenes-QA Evaluation.As shown in Table 2, SNOW
+establishes a new state-of-the-art on NuScenes-QA [39]
+with an overall accuracy of 60.1% despite operating entirely
+without training or fine-tuning. The most pronounced im-
+provement appears in theStatuscategory (+23.5%), indicat-
+ing that SNOW’s STEP-tokenized spatio-temporal 4DSG
+enables explicit reasoning over dynamic object states such
+as motion, orientation, or occlusion. Additional gains
+emerge inCount(+4.7%) andObject(+2.9%), reflecting
+enhanced multi-entity grounding and robust object identity
+preservation. Performance inExistenceandComparisonre-
+mains comparable to prior work. These results highlight
+that SNOW leverages multimodal spatio-temporal ground-
+ing not only to answer static visual queries but also to in-
+tegrate evidence across frames, supporting richer 4D scene
+understanding without domain-specific adaptation.
+RoboSpatial-Home Evaluation.RoboSpatial-
+Home [43] evaluates grounded spatial reasoning inMethod Cfg.↑Ctxt.↑Cpt.↑Avg.↑
+VILA [43] 57.8 0.0 69.0 42.3
+VILA +RS [43] 65.9 15.6 78.0 53.2
+LLaV A-NeXT [43] 68.3 0.0 70.5 46.3
+LLaV A-NeXT +RS [43] 78.9 19.7 80.1 59.6
+SpaceLLaV A [43] 61.0 2.5 61.0 41.5
+SpaceLLaV A +RS [43] 71.6 13.1 72.4 52.4
+RoboPoint [43] 69.9 19.7 70.5 53.4
+RoboPoint +RS [43] 78.0 31.1 81.063.4
+3D-LLM [43] 39.8 0.0 35.2 25.0
+3D-LLM +RS [43] 55.2 8.2 52.3 37.6
+LEO [43] 51.2 0.0 38.1 29.8
+LEO +RS [43] 64.2 10.0 57.1 43.8
+Molmo [43] 58.6 0.1 18.1 25.6
+GPT-4o [43] 77.2 5.7 58.1 47.0
+NaviMaster [32] – 21.65 – –
+SNOW(Ours) 84.55 54.9278.1072.29
+Table 3.RoboSpatial-Home grounded VQA evaluation.Mod-
+els are evaluated on three dimensions: Configuration (Cfg.), Con-
+text (Ctxt.), and Compatibility (Cpt.), with Avg. reporting their
+mean. “+RS” denotes models finetuned on the RoboSpatial
+dataset. SNOW operates in a fully training-free setting, using its
+4DSG as a persistent spatial representation.Boldindicates the
+highest score and underline the second highest score.
+real indoor environments. The benchmark tests three com-
+plementary dimensions of spatial understanding: (i)Spatial
+Contextmeasures whether a model can identify suitable
+free or support surfaces by predicting a point location in
+the scene; (ii)Spatial Compatibilityevaluates whether a
+region can feasibly support a given object, formulated as
+binary feasibility judgments; and (iii)Spatial Configuration
+assesses relative object-to-object spatial relationships.
+We compare SNOW against pretrained and RoboSpatial-
+finetuned models (cf. Table 3). Unlike approaches re-
+quiring task-specific finetuning or spatial alignment train-
+ing, SNOW performs zero-shot grounding via its STEP-
+based 4DSG. SNOW establishes a new state-of-the-art aver-
+age performance on RoboSpatial-Home of 72.29% (cf. Ta-
+ble 3). Most notably, SNOW improvesSpatial Contextby
+a substantial margin of +23.82%, the most challenging di-
+mension requiring continuous-point spatial grounding, out-
+performing all prior systems including those explicitly fine-
+tuned on RoboSpatial (“+RS”) (cf. Figure 4). SNOW
+further achieves +7.35% inSpatial Configurationand re-
+mains competitive inSpatial Compatibility(-2.9%), indi-
+cating consistent generalization across complementary spa-
+tial reasoning tasks. Critically, SNOW attains these results
+without training, whereas prior leading approaches rely on
+benchmark-specific finetuning and spatial alignment train-
+ing. These findings demonstrate that structured 4D scene
+representations and STEP-based grounding enable strong
+spatial understanding. Further qualitative success and fail-
+ure cases are provided and discussed in Appendix 7.
+6
+
+
+--- Page 7 ---
+Model Ego-C.↑Exo-C.↑Avg.↑ Direct.↑FP↑Avg.↑ Overall↑
+GPT-4o [57] 55.5 62.2 60.0 49.5 53.3 49.9 57.5
+Gemini-2.5-Pro [57] 64.6 62.9 63.5 54.8 80.0 57.3 62.0
+Claude-Sonnet-4 [57] 52.6 52.1 52.2 44.086.748.3 51.3
+Llama-4-Maverick-17B [57] 52.6 54.3 53.8 53.3 51.1 53.0 53.6
+Llama-4-Scout-17B [57] 48.6 56.2 53.7 53.3 75.6 55.5 54.1
+Qwen2.5-VL-72B [57] 54.3 52.5 53.1 49.5 80.0 52.6 53.0
+InternVideo2.5-8B [57] 57.2 50.5 52.7 44.3 46.7 44.5 50.7
+SNOW(Ours) 73.04 72.78 72.87 71.1677.8676.46 73.75
+Table 4.VLM4D evaluation.Accuracy (↑) is reported for egocentric (Ego-C.) and exocentric (Exo-C.) reasoning, their average, directional
+(Direct.), and false positive reasoning (FP). The final columns provide the average across reasoning types and the overall benchmark score.
+Boldindicates the highest score and underline the second highest score.
+VLM4D Evaluation.Table 4 presents a comprehensive
+comparison of SNOW against state-of-the-art models on the
+VLM4D benchmark. SNOW achieves 73.04% ego-centric
+and 72.78% exo-centric reasoning accuracy, corresponding
+to absolute improvements of +8.44% and +9.88% over the
+strongest baseline (Gemini-2.5-Pro), and yields an average
+reasoning gain of +9.37%. In directional reasoning, SNOW
+attains 71.16%, surpassing the best prior model by a signif-
+icant margin of +16.36%.
+For false positive (FP) reasoning, SNOW scores 77.86%,
+which is comparable to high-performing baselines, confirm-
+ing that 4D spatio-temporal modeling is primarily bene-
+ficial for scenario comprehension rather than for FP de-
+tection. Overall, SNOW achieves an overall benchmark
+score of 73.75%, outperforming all baselines substantially
+by +11.75% on average. These results quantitatively un-
+derline that the integration of 4D STEP tokens significantly
+enhances the model’s ability to reason about space and
+time, particularly in ego-, exo-centric, and directional con-
+texts. Qualitative examples are provided in Appendix 8
+to further illustrate SNOW’s spatio-temporal understanding
+along with success and failure cases.
+Downstream Tasks Evaluation on NuScenes.Table 5
+presents a comparison between SNOW and recent open-
+vocabulary LiDAR segmentation models on NuScenes Li-
+DAR segmentation [9]. Evaluation is conducted on the
+validation splitusing the mean IoU (mIoU) metric. Un-
+like prior methods that depend on task-specific finetuning
+or adaptation, SNOW performs 3D point-level grounding
+in a fully training-free manner by directly projecting STEP
+token embeddings into the LiDAR space. Despite this zero-
+shot setting, SNOW achieves an mIoU of 38.1, ranking sec-
+ond overall and surpassing several approaches requiring ad-
+ditional training. This result highlights the effectiveness of
+SNOW’s 4D STEP representation, where structured spatial-
+temporal object embeddings inherently encode transfer-
+able geometric and semantic priors, enabling consistent and
+modality-agnostic instance grounding in 3D scenes. Fur-Method mIoU↑TF
+CNS [2] 26.8✗
+AdaCo [63] 31.2✗
+3D-A VS [49] 36.2✗
+OpenScene [37] 36.7✗
+OV3D [20] 44.6✗
+SNOW(Ours) 38.1 ✓
+Table 5.LiDAR segmentation.Comparison of SNOW with
+open-vocabulary segmentation models on the NuScenes LiDAR
+segmentation task, using the official mIoU metric. “TF” indicates
+weather the method is training-free (✓).Boldindicates the highest
+score and underline the second highest score.
+Figure 4.Qualitative examples of SNOW on RoboSpatial-
+Home and open-vocabulary LiDAR segmentation.For
+RoboSpatial-Home, red denotes the model prediction; blue de-
+notes the ground truth reference.
+ther qualitative examples can be observed in Figure 4 and
+Appendix 9.
+4.3. Ablation Study
+To complement benchmark results, we analyze the contri-
+bution of SNOW’s core representation components on 4D
+reasoning performance. All variants are evaluated on a 200
+7
+
+
+--- Page 8 ---
+ID 2D + t 4D-STEP Ego-C.↑Exo-C.↑Avg.↑ Drct.↑FP↑Avg.↑ Overall↑
+A1†✗ ✗ 38.0 42.0 40.0 43.074.058.5 49.25
+A2†✓ ✗ 56.0 62.0 59.0 58.0 72.0 65.0 62.0
+A3†✗ ✓ 78.0 82.0 80.0 76.0 74.0 75.0 77.5
+Table 6.Ablation study of SNOW on VLM4D.Each configuration isolates the contributions of temporal linking across frames (“2D +
+t”), and the 4D STEP tokens (“4D-STEP”) over the baseline model. Performance is reported using VLM4D accuracy metrics (↑).†Results
+are evaluated on a 200 question subset of the benchmark.Boldindicates the highest score and underline the second highest score.
+question subset of the VLM4D benchmark [57], using the
+same VLM backbone and input time window ofT= 10
+frames. Questions are equally distributed across categories
+(i.e., 50 per benchmark category).
+A1 (VLM-Only Baseline).The backbone model
+(Gemma3-4B-IT [12]) receives RGB frames over the tem-
+poral window but no structured multi-view or temporal as-
+sociation. This setting isolates the language and perception
+capabilities of the VLM without explicit scene structure.
+A2 (2D Temporal Tracking Only).Object instances are
+tracked over time in the image plane. STEP token appear-
+ance and disappearance timestamps are maintained, but no
+3D spatial tokens are available. This setting captures tem-
+poral continuity but lacks spatial coherence.
+A3 (Full 4D STEP Representation).3D spatial struc-
+ture and temporal instance links are fused into unified STEP
+tokens. Each object maintains a temporally indexed se-
+quence of spatially consistent embeddings, forming the ba-
+sis of the 4DSG representation used by SNOW.
+The progression from A1 to A3 highlights the role of
+structured 4D scene representation in supporting robust rea-
+soning. Introducing only 2D temporal tracking (A2) yields
+a substantial improvement over the VLM-only baseline
+(A1), particularly in ego- (+18%) and exo-centric spatial
+reasoning (+20%). This indicates that maintaining object
+identity across time is already a strong inductive prior for
+understanding dynamic scenes. However, without spatial
+grounding, reasoning remains limited when queries involve
+viewpoint transformation or require resolving object inter-
+actions in 3D space. FP does not benefit from the 4D STEP
+representation, as these questions do not require spatial or
+temporal grounding but solely the reasoning whether ob-
+jects are present or not, which is given in the patch tokens
+already provided in the baseline models.
+The full 4D STEP representation (A3) further improves
+performance across all metrics, most prominently in spa-
+tial reasoning (Ego-C., Exo-C.) where we observe gains of
++22% and +20% over A2. STEP tokens provide tempo-
+rally indexed 3D-consistent embeddings, enabling SNOW
+to localize, compare, and relate objects across space-time
+rather than relying solely on image-plane continuity. This
+reduces perspective ambiguity and allows the model to an-
+swer queries in 4D involving object placement, motion tra-
+jectories, and cross-frame relational constraints. The fi-nal “Overall” score increases from 49.25% (A1) to 62.0%
+(A2) and further to 77.5% (A3), confirming that 4D spatial-
+temporal grounding (i.e., STEP tokens) is the dominant
+contributor to SNOW’s reasoning capability.
+5. Conclusion
+We presentedSNOW, a training-free and backbone-
+agnostic framework for 4D spatio-temporal scene under-
+standing in open-world robotic environments. By clus-
+tering point clouds, point-prompting SAM2 for segmenta-
+tion, and enriching objects with geometric and temporal at-
+tributes, SNOW unifies 3D structure, open-vocabulary se-
+mantics, and temporal dynamics into a single coherent rep-
+resentation. Its tokenized 4DSG enables compact yet ex-
+pressive encoding of object-level information and maintains
+temporal continuity through globally aligned semantic in-
+formation. This design provides several advantages: (i) it
+supports plug-and-play integration with diverse VLMs and
+sensing modalities, (ii) generalizes across both static and
+dynamic environments without retraining, and (iii) offers
+persistent memory for long-horizon reasoning and spatio-
+temporal grounding. SNOW achieves consistent improve-
+ments across 4D understanding benchmarks, demonstrat-
+ing that structured STEP tokenization can serve as a uni-
+versal interface between geometric perception and founda-
+tion models. Beyond perception, SNOW offers a scalable
+foundation for embodied agents, enabling unified scene in-
+terpretation, semantic mapping, and temporal abstraction in
+physically grounded world models.
+Limitations and Future Work.The current implemen-
+tation accumulates long sequences of STEP tokens, which
+slows inference on large-scale scenes and long temporal se-
+quences. Also, the 4DSG effectively captures global motion
+but may underrepresent fine-grained dynamics and object
+morphing. Future work will therefore explore (i) explicit
+point tracking for local motion modeling, (ii) latent-space
+fusion modules for faster and more compact token integra-
+tion, (iii) encoders with learned 4D representations and at-
+tention mechanisms, whereas SNOW could serve as a train-
+ing pipeline for data acquisition, and (iv) studies on STEP
+token ordering and temporal compression to enhance down-
+stream performance. These directions aim to extend SNOW
+towards scalable, real-time 4D scene understanding.
+8
+
+
+--- Page 9 ---
+References
+[1] Ricardo J. G. B. Campello, Davoud Moulavi, and Joerg
+Sander. Density-based clustering based on hierarchical den-
+sity estimates. InAdvances in Knowledge Discovery and
+Data Mining, pages 160–172, Berlin, Heidelberg, 2013.
+Springer Berlin Heidelberg. 2, 3
+[2] Runnan Chen, Youquan Liu, Lingdong Kong, Nenglun
+Chen, Xinge Zhu, Yuexin Ma, Tongliang Liu, and Wenping
+Wang. Towards label-free scene understanding by vision
+foundation models, 2023. 7
+[3] Yilun Chen, Shuai Yang, Haifeng Huang, Tai Wang, Run-
+sen Xu, Ruiyuan Lyu, Dahua Lin, and Jiangmiao Pang.
+Grounded 3d-llm with referent tokens, 2024. 2
+[4] Zheng Chu, Jingchang Chen, Qianglong Chen, Weijiang Yu,
+Haotian Wang, Ming Liu, and Bing Qin. Timebench: A com-
+prehensive evaluation of temporal reasoning abilities in large
+language models, 2024. 2
+[5] Can Cui, Yunsheng Ma, Xu Cao, Wenqian Ye, and Ziran
+Wang. Drive as you speak: Enabling human-like interac-
+tion with large language models in autonomous vehicles. In
+Proceedings of the IEEE/CVF Winter Conference on Appli-
+cations of Computer Vision (WACV) Workshops, pages 902–
+909, 2024. 2
+[6] Can Cui, Yunsheng Ma, Xu Cao, Wenqian Ye, and Ziran
+Wang. Receive, reason, and react: Drive as you say, with
+large language models in autonomous vehicles.IEEE Intel-
+ligent Transportation Systems Magazine, 16(4):81–94, 2024.
+2
+[7] Jiajun Deng, Tianyu He, Li Jiang, Tianyu Wang, Feras Day-
+oub, and Ian Reid. 3d-llava: Towards generalist 3d lmms
+with omni superpoint transformer, 2025. 2
+[8] Xinpeng Ding, Jianhua Han, Hang Xu, Xiaodan Liang, Wei
+Zhang, and Xiaomeng Li. Holistic autonomous driving un-
+derstanding by bird’s-eye-view injected multi-modal large
+models. InProceedings of the IEEE/CVF Conference on
+Computer Vision and Pattern Recognition (CVPR), pages
+13668–13677, 2024. 2
+[9] Whye Kit Fong, Rohit Mohan, Juana Valeria Hurtado, Lub-
+ing Zhou, Holger Caesar, Oscar Beijbom, and Abhinav Val-
+ada. Panoptic nuscenes: A large-scale benchmark for li-
+dar panoptic segmentation and tracking.arXiv preprint
+arXiv:2109.03805, 2021. 6, 7
+[10] Whye Kit Fong, Rohit Mohan, Juana Valeria Hurtado, Lub-
+ing Zhou, Holger Caesar, Oscar Beijbom, and Abhinav Val-
+ada. Panoptic nuscenes: A large-scale benchmark for li-
+dar panoptic segmentation and tracking.arXiv preprint
+arXiv:2109.03805, 2021. 2
+[11] Peng Gao, Jiaming Han, Renrui Zhang, Ziyi Lin, Shijie
+Geng, Aojun Zhou, Wei Zhang, Pan Lu, Conghui He, Xi-
+angyu Yue, Hongsheng Li, and Yu Qiao. Llama-adapter v2:
+Parameter-efficient visual instruction model, 2023. 6
+[12] Gemma Team. Gemma 3 technical report, 2025. 6, 8, 2
+[13] Tiziano Guadagnino, Benedikt Mersch, Saurabh Gupta, Ig-
+nacio Vizzo, Giorgio Grisetti, and Cyrill Stachniss. Kiss-
+slam: A simple, robust, and accurate 3d lidar slam system
+with enhanced generalization capabilities, 2025. 2, 3, 5, 6, 1[14] Ziyu Guo, Renrui Zhang, Xiangyang Zhu, Yiwen Tang, Xi-
+anzheng Ma, Jiaming Han, Kexin Chen, Peng Gao, Xianzhi
+Li, Hongsheng Li, and Pheng-Ann Heng. Point-bind &
+point-llm: Aligning point cloud with multi-modality for 3d
+understanding, generation, and instruction following, 2023.
+2
+[15] Bo He, Hengduo Li, Young Kyun Jang, Menglin Jia, Xue-
+fei Cao, Ashish Shah, Abhinav Shrivastava, and Ser-Nam
+Lim. Ma-lmm: Memory-augmented large multimodal model
+for long-term video understanding. InProceedings of the
+IEEE/CVF Conference on Computer Vision and Pattern
+Recognition (CVPR), pages 13504–13514, 2024. 2
+[16] Qingdong He, Jinlong Peng, Zhengkai Jiang, Kai Wu, Xi-
+aozhong Ji, Jiangning Zhang, Yabiao Wang, Chengjie Wang,
+Mingang Chen, and Yunsheng Wu. Unim-ov3d: Uni-
+modality open-vocabulary 3d scene understanding with fine-
+grained feature representation, 2024. 2
+[17] Yining Hong, Haoyu Zhen, Peihao Chen, Shuhong Zheng,
+Yilun Du, Zhenfang Chen, and Chuang Gan. 3d-llm: Inject-
+ing the 3d world into large language models, 2023. 2
+[18] Jyh-Jing Hwang, Runsheng Xu, Hubert Lin, Wei-Chih Hung,
+Jingwei Ji, Kristy Choi, Di Huang, Tong He, Paul Covington,
+Benjamin Sapp, Yin Zhou, James Guo, Dragomir Anguelov,
+and Mingxing Tan. Emma: End-to-end multimodal model
+for autonomous driving, 2024. 2
+[19] Jiayi Ji, Haowei Wang, Changli Wu, Yiwei Ma, Xiaoshuai
+Sun, and Rongrong Ji. Jm3d & jm3d-llm: Elevating 3d rep-
+resentation with joint multi-modal cues.IEEE Transactions
+on Pattern Analysis and Machine Intelligence, 47(4):2475–
+2492, 2025. 2
+[20] Li Jiang, Shaoshuai Shi, and Bernt Schiele. Open-vocabulary
+3d semantic segmentation with foundation models. InPro-
+ceedings of the IEEE/CVF Conference on Computer Vision
+and Pattern Recognition (CVPR), pages 21284–21294, 2024.
+7
+[21] Siwen Jiao, Yangyi Fang, Baoyun Peng, Wangqun Chen, and
+Bharadwaj Veeravalli. Lavida drive: Vision-text interaction
+vlm for autonomous driving with token selection, recovery
+and enhancement, 2025. 2
+[22] Nikhil Keetha, Norman M ¨uller, Johannes Sch ¨onberger,
+Lorenzo Porzi, Yuchen Zhang, Tobias Fischer, Arno
+Knapitsch, Duncan Zauss, Ethan Weber, Nelson Antunes,
+Jonathon Luiten, Manuel Lopez-Antequera, Samuel Rota
+Bul`o, Christian Richardt, Deva Ramanan, Sebastian Scherer,
+and Peter Kontschieder. Mapanything: Universal feed-
+forward metric 3d reconstruction, 2025. 2, 3, 5, 6, 1
+[23] Harold W Kuhn. The hungarian method for the assignment
+problem.Naval research logistics quarterly, 2(1-2):83–97,
+1955. 3
+[24] Hongyu Li, Jinyu Chen, Ziyu Wei, Shaofei Huang, Tianrui
+Hui, Jialin Gao, Xiaoming Wei, and Si Liu. Llava-st: A
+multimodal large language model for fine-grained spatial-
+temporal understanding. InProceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition
+(CVPR), pages 8592–8603, 2025. 3
+[25] KunChang Li, Yinan He, Yi Wang, Yizhuo Li, Wenhai
+Wang, Ping Luo, Yali Wang, Limin Wang, and Yu Qiao.
+Videochat: Chat-centric video understanding, 2024. 2
+9
+
+
+--- Page 10 ---
+[26] Kunchang Li, Yali Wang, Yinan He, Yizhuo Li, Yi Wang,
+Yi Liu, Zun Wang, Jilan Xu, Guo Chen, Ping Luo, Limin
+Wang, and Yu Qiao. Mvbench: A comprehensive multi-
+modal video understanding benchmark. InProceedings of
+the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition (CVPR), pages 22195–22206, 2024. 2
+[27] Yanwei Li, Chengyao Wang, and Jiaya Jia. Llama-vid: An
+image is worth 2 tokens in large language models. InCom-
+puter Vision – ECCV 2024, pages 323–340, Cham, 2025.
+Springer Nature Switzerland. 2
+[28] Bin Lin, Yang Ye, Bin Zhu, Jiaxi Cui, Munan Ning, Peng
+Jin, and Li Yuan. Video-llava: Learning united visual repre-
+sentation by alignment before projection, 2024. 2
+[29] Dingning Liu, Xiaoshui Huang, Yuenan Hou, Zhihui Wang,
+Zhenfei Yin, Yongshun Gong, Peng Gao, and Wanli Ouyang.
+Uni3d-llm: Unifying point cloud perception, generation and
+editing with large language models, 2024. 2
+[30] Haotian Liu, Chunyuan Li, Yuheng Li, and Yong Jae Lee.
+Improved baselines with visual instruction tuning. InPro-
+ceedings of the IEEE/CVF Conference on Computer Vision
+and Pattern Recognition (CVPR), pages 26296–26306, 2024.
+6
+[31] Ruyang Liu, Chen Li, Haoran Tang, Yixiao Ge, Ying Shan,
+and Ge Li. St-llm: Large language models are effective tem-
+poral learners. InComputer Vision – ECCV 2024, pages 1–
+18, Cham, 2025. Springer Nature Switzerland. 2
+[32] Zhihao Luo, Wentao Yan, Jingyu Gong, Min Wang,
+Zhizhong Zhang, Xuhong Wang, Yuan Xie, and Xin Tan.
+Navimaster: Learning a unified policy for gui and embodied
+navigation tasks, 2025. 6
+[33] Muhammad Maaz, Hanoona Rasheed, Salman Khan, and Fa-
+had Shahbaz Khan. Video-chatgpt: Towards detailed video
+understanding via large vision and language models, 2024. 2
+[34] Jiageng Mao, Yuxi Qian, Junjie Ye, Hang Zhao, and Yue
+Wang. Gpt-driver: Learning to drive with gpt, 2023. 2
+[35] Yongsen Mao, Junhao Zhong, Chuan Fang, Jia Zheng, Rui
+Tang, Hao Zhu, Ping Tan, and Zihan Zhou. Spatiallm: Train-
+ing large language models for structured indoor modeling,
+2025. 2
+[36] Shehan Munasinghe, Rusiru Thushara, Muhammad Maaz,
+Hanoona Abdul Rasheed, Salman Khan, Mubarak Shah, and
+Fahad Khan. Pg-video-llava: Pixel grounding large video-
+language models, 2023. 3
+[37] Songyou Peng, Kyle Genova, Chiyu ”Max” Jiang, An-
+drea Tagliasacchi, Marc Pollefeys, and Thomas Funkhouser.
+Openscene: 3d scene understanding with open vocabularies,
+2023. 7
+[38] Zhangyang Qi, Ye Fang, Zeyi Sun, Xiaoyang Wu, Tong Wu,
+Jiaqi Wang, Dahua Lin, and Hengshuang Zhao. Gpt4point:
+A unified framework for point-language understanding and
+generation. InProceedings of the IEEE/CVF Conference
+on Computer Vision and Pattern Recognition (CVPR), pages
+26417–26427, 2024. 2
+[39] Tianwen Qian, Jingjing Chen, Linhai Zhuo, Yang Jiao, and
+Yu-Gang Jiang. Nuscenes-qa: A multi-modal visual question
+answering benchmark for autonomous driving scenario.Pro-
+ceedings of the AAAI Conference on Artificial Intelligence,
+38(5):4542–4550, 2024. 5, 6[40] Kanchana Ranasinghe, Satya Narayan Shukla, Omid Pour-
+saeed, Michael S. Ryoo, and Tsung-Yu Lin. Learning to lo-
+calize objects improves spatial reasoning in visual-llms. In
+Proceedings of the IEEE/CVF Conference on Computer Vi-
+sion and Pattern Recognition (CVPR), pages 12977–12987,
+2024. 2
+[41] Nikhila Ravi, Valentin Gabeur, Yuan-Ting Hu, Ronghang
+Hu, Chaitanya Ryali, Tengyu Ma, Haitham Khedr, Roman
+R¨adle, Chloe Rolland, Laura Gustafson, Eric Mintun, Junt-
+ing Pan, Kalyan Vasudev Alwala, Nicolas Carion, Chao-
+Yuan Wu, Ross Girshick, Piotr Doll ´ar, and Christoph Feicht-
+enhofer. Sam 2: Segment anything in images and videos,
+2024. 2, 3, 6, 1
+[42] Tin Stribor Sohn, Philipp Reis, Maximilian Dillitzer, Jo-
+hannes Bach, Jason J. Corso, and Eric Sax. A framework
+for a capability-driven evaluation of scenario understanding
+for multimodal large language models in autonomous driv-
+ing, 2025. 2
+[43] Chan Hee Song, Valts Blukis, Jonathan Tremblay, Stephen
+Tyree, Yu Su, and Stan Birchfield. Robospatial: Teaching
+spatial understanding to 2d and 3d vision-language models
+for robotics, 2025. 5, 6, 1
+[44] Zongheng Tang, Yue Liao, Si Liu, Guanbin Li, Xiaojie Jin,
+Hongxu Jiang, Qian Yu, and Dong Xu. Human-centric
+spatio-temporal video grounding with visual transformers.
+IEEE Transactions on Circuits and Systems for Video Tech-
+nology, 32(12):8238–8249, 2022. 3
+[45] Jiayu Wang, Yifei Ming, Zhenmei Shi, Vibhav Vineet, Xin
+Wang, Yixuan Li, and Neel Joshi. Is a picture worth a thou-
+sand words? delving into spatial reasoning for vision lan-
+guage models, 2024. 2
+[46] Jiankang Wang, Zhihan Zhang, Zhihang Liu, Yang Li, Jian-
+nan Ge, Hongtao Xie, and Yongdong Zhang. Spacevllm:
+Endowing multimodal large language model with spatio-
+temporal video grounding capability, 2025. 3
+[47] Yuqing Wang and Yun Zhao. Tram: Benchmarking temporal
+reasoning for large language models, 2024. 2
+[48] Julong Wei, Shanshuai Yuan, Pengfei Li, Qingda Hu,
+Zhongxue Gan, and Wenchao Ding. Occllama: An
+occupancy-language-action generative world model for au-
+tonomous driving, 2024. 2, 6
+[49] Weijie Wei, Osman ¨Ulger, Fatemeh Karimi Nejadasl, Theo
+Gevers, and Martin R. Oswald. 3d-avs: Lidar-based 3d auto-
+vocabulary segmentation. InProceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition
+(CVPR), pages 8910–8920, 2025. 7
+[50] Zhenhua Xu, Yujia Zhang, Enze Xie, Zhen Zhao, Yong Guo,
+Kwan-Yee K. Wong, Zhenguo Li, and Hengshuang Zhao.
+Drivegpt4: Interpretable end-to-end autonomous driving via
+large language model.IEEE Robotics and Automation Let-
+ters, 9(10):8186–8193, 2024. 2
+[51] Antoine Yang, Antoine Miech, Josef Sivic, Ivan Laptev, and
+Cordelia Schmid. Tubedetr: Spatio-temporal video ground-
+ing with transformers. InProceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition
+(CVPR), pages 16442–16453, 2022. 3
+[52] Senqiao Yang, Jiaming Liu, Ray Zhang, Mingjie Pan, Zoey
+Guo, Xiaoqi Li, Zehui Chen, Peng Gao, Yandong Guo, and
+10
+
+
+--- Page 11 ---
+Shanghang Zhang. Lidar-llm: Exploring the potential of
+large language models for 3d lidar understanding, 2023. 6
+[53] Jirong Zha, Yuxuan Fan, Xiao Yang, Chen Gao, and Xinlei
+Chen. How to enable llm with 3d capacity? a survey of
+spatial reasoning in llm, 2025. 2
+[54] Jianrui Zhang, Mu Cai, Tengyang Xie, and Yong Jae Lee.
+Countercurate: Enhancing physical and semantic visio-
+linguistic compositional reasoning via counterfactual exam-
+ples, 2024. 2
+[55] Renrui Zhang, Ziyu Guo, Wei Zhang, Kunchang Li, Xu-
+peng Miao, Bin Cui, Yu Qiao, Peng Gao, and Hongsheng
+Li. Pointclip: Point cloud understanding by clip. InPro-
+ceedings of the IEEE/CVF Conference on Computer Vision
+and Pattern Recognition (CVPR), pages 8552–8562, 2022. 2
+[56] Zhu Zhang, Zhou Zhao, Yang Zhao, Qi Wang, Huasheng
+Liu, and Lianli Gao. Where does it exist: Spatio-temporal
+video grounding for multi-form sentences. InProceedings
+of the IEEE/CVF Conference on Computer Vision and Pat-
+tern Recognition (CVPR), 2020. 3
+[57] Shijie Zhou, Alexander Vilesov, Xuehai He, Ziyu Wan,
+Shuwang Zhang, Aditya Nagachandra, Di Chang, Dongdong
+Chen, Xin Eric Wang, and Achuta Kadambi. Vlm4d: To-
+wards spatiotemporal awareness in vision language models,
+2025. 6, 7, 8
+[58] Xingcheng Zhou, Xuyuan Han, Feng Yang, Yunpu Ma, and
+Alois C. Knoll. Opendrivevla: Towards end-to-end au-
+tonomous driving with large vision language action model,
+2025. 2, 6
+[59] Yunsong Zhou, Linyan Huang, Qingwen Bu, Jia Zeng,
+Tianyu Li, Hang Qiu, Hongzi Zhu, Minyi Guo, Yu Qiao, and
+Hongyang Li. Embodied understanding of driving scenarios.
+InComputer Vision – ECCV 2024, pages 129–148, Cham,
+2025. Springer Nature Switzerland. 2
+[60] Chenming Zhu, Tai Wang, Wenwei Zhang, Kai Chen, and
+Xihui Liu. Scanreason: Empowering 3d visual grounding
+with reasoning capabilities. InComputer Vision – ECCV
+2024, pages 151–168, Cham, 2025. Springer Nature Switzer-
+land. 2
+[61] Chenming Zhu, Tai Wang, Wenwei Zhang, Jiangmiao Pang,
+and Xihui Liu. Llava-3d: A simple yet effective pathway to
+empowering lmms with 3d-awareness, 2025. 2
+[62] Xiangyang Zhu, Renrui Zhang, Bowei He, Ziyu Guo, Ziyao
+Zeng, Zipeng Qin, Shanghang Zhang, and Peng Gao. Point-
+clip v2: Prompting clip and gpt for powerful 3d open-world
+learning. InProceedings of the IEEE/CVF International
+Conference on Computer Vision (ICCV), pages 2639–2650,
+2023. 2
+[63] Pufan Zou, Shijia Zhao, Weijie Huang, Qiming Xia, Chenglu
+Wen, Wei Li, and Cheng Wang. Adaco: Overcoming vi-
+sual foundation model noise in 3d semantic segmentation via
+adaptive label correction, 2024. 7
+11
+
+
+--- Page 12 ---
+SNOW: Spatio-Temporal Scene Understanding with World Knowledge for
+Open-World Embodied Reasoning
+Supplementary Material
+6. 4DSG Generation of SNOW
+Algorithm 1 summarizes the full procedure used to con-
+struct the 4D Scene Graph (4DSG) described in Section 3.
+The pipeline processes synchronized point clouds and im-
+ages in a streaming fashion, progressively forming a tempo-
+rally grounded representation of object-level structure and
+motion.
+At each timestep, the input point cloud is iteratively par-
+titioned into object-level regions through a cycle of ge-
+ometric clustering, multi-view projection, and segmenta-
+tion refinement using SAM2 [41]. This iterative formula-
+tion serves two purposes: (i) it progressively resolves ob-
+ject boundaries in challenging cluttered or partially visible
+scenes, and (ii) it prevents premature object consolidation
+by deferring assignment for geometrically implausible clus-
+ters. Each stabilized region is encoded into aSTEP token,
+which captures shape, trajectory-consistent position, esti-
+mated extent, and appearance or disappearance across time.
+These tokens form a compact latent representation that sup-
+ports direct interfacing with VLMs.
+To model temporal continuity, STEP tokens associated
+with the same physical object are linked over a sliding win-
+dow ofTframes. This token-level temporal linking avoids
+explicit tracking heuristics and ensures that changes in ge-
+ometry and viewpoint are absorbed naturally into the rep-
+resentation. The resulting temporally aligned STEP se-
+quences form the node embeddings of the 4DSG. Graph
+edges encode spatial relations derived from 3D proximity
+and relative orientation.
+A SLAM backend maintains a globally consistent co-
+ordinate frame, allowing object identities and their spatial
+positions to remain stable across time. Additionally, they
+provide ego position and poses over time, accounting for
+camera motion and embodied agent self-awareness, which
+both is embedded into the 4DSG. We use KISS-SLAM [13]
+when LiDAR is available and MapAnything [22] for image-
+only reconstruction. This ensures that the 4DSG encodes
+spatial layout and temporal evolution in a common refer-
+ence frame independent of sensing modality.
+The final 4DSG at timetis a queryable object-centric
+memory of the scene over the temporal windowt−T:t.
+Downstream inference tasks (e.g., open-vocabulary scene
+understanding, spatio-temporal reasoning) interact directly
+with the 4DSG, allowing VLMs to operate over structured
+4D context instead of raw sensor data. Because the rep-
+resentation is token-based, no additional pooling, feature
+alignment, or task-specific training is required. The pseu-Algorithm 14D Spatio-Temporal Scene Understanding
+with SNOW and STEP Encoding
+Require:Point clouds{Pt}0:T, image sequence{It
+c}0:T, tem-
+poral windowT, iterationsN iter, reasoning hopsH hop, VLM
+backbone
+1:Initialize persistent 4DSGM0← ∅
+2:foreach time steptdo
+3:Initialize unmapped pointsUt←Pt
+4:forn= 1. . . N iterdo
+5:ClusterUt→Rt, sample proposalsVt
+k
+6:Project allpt
+i∈Pt
+kto imagesIt
+c
+7:Prompt SAM2 with{Vt
+k}img→masksmt
+k,c
+8:Match across views→mt
+k, assign points→ ˆRt
+k
+9:Encode objects→STEP tokensSt
+k
+10:forh= 1. . . H hopdo
+11:Detect implausible geometries, reassign toUt
+12:end for
+13:Ut←Pt\S
+kˆRt
+k
+14:ifUt=∅then break
+15:end if
+16:end for
+17:Build spatial scene graph att:Gt= (Vt,Et)
+18:Update temporal representationF k← {St−T
+k, . . . , St
+k}
+19:Based onF k, fuseGtinto 4DSGMt
+20:Query VLM with(q| Mt)→ˆy
+21:end for
+docode in Algorithm 1 outlines this process step-by-step,
+illustrating how structured 4D representations emerge from
+multimodal association and temporal consolidation.
+7. Further Results on RoboSpatial-Home
+Figure 5 presents qualitative examples of SNOW on the
+RoboSpatial-Home benchmark [43], focusing on thepin-
+pointingtask. We highlight this task as it constitutes the
+most demanding spatial reasoning setting in RoboSpatial-
+Home. Despite being a training-free approach, SNOW
+achieves new state-of-the-art performance (cf. Section 4.2),
+demonstrating strong zero-shot spatial localization and
+grounding ability.
+The first row of Figure 5 illustrates representative suc-
+cess cases, in which SNOW accurately infers and pinpoints
+positions in spatial relation to the referenced object. The
+middle row shows failure cases that arise not from model
+limitations but from inherent question ambiguity. For ex-
+ample, several benchmark questions describe spatial rela-
+tions imprecisely (e.g., “vacant space in front of the bot-
+1
+
+
+--- Page 13 ---
+tle”, Q.052, cf. Table 7), where multiple positions are se-
+mantically valid and SNOW points to one of those loca-
+tions. In such cases, SNOW’s predictions are reasonable yet
+counted as incorrect due to the benchmark’s single ground-
+truth polygon annotation. For clarity, we provide the origi-
+nal benchmark question formulations in Table 7. These in-
+stances suggest that evaluation errors may originate from
+low-spec or under-specified spatial language instructions
+rather than model failure; thus, they should be interpreted
+cautiously.
+The bottom row contains genuine error cases, where
+SNOW’s prediction diverges from the intended spatial re-
+lation. Even here, some errors occur when SNOW predicts
+a region that is spatially correct but lies slightly outside the
+annotated ground-truth polygon (e.g., Q.55). This reflects
+a known limitation of polygon-based evaluation for open
+spatial reasoning tasks, where the “correct region” is itself
+continuous rather than discretely bounded.
+Overall, SNOW demonstrates robust and generalizable
+spatial reasoning in the zero-shot setting, but these exam-
+ples highlight that future benchmarks would benefit from
+(i) more precise spatial language phrasing and (ii) tolerance-
+based or region-proposal-based evaluation metrics to avoid
+penalizing semantically valid predictions. We emphasize
+that these observations are intended to contextualize eval-
+uation behavior rather than critique the benchmark design
+itself.
+8. Further Results on VLM4D
+Table 8 presents selected examples from the VLM4D
+benchmark to illustrate SNOW’s qualitative performance
+across diverse scenarios. We include representative ques-
+tions from four categories:Curling,Burnout,Desk, andFu-
+turistic Car.
+In theCurlingandDeskscenarios, SNOW perfectly
+reproduces the ground truth, demonstrating precise ego-
+centric and exo-centric spatial reasoning, as well as fine-
+grained action understanding. TheBurnoutscenario high-
+lights more challenging directional reasoning under com-
+plex motion; while SNOW occasionally differs from ground
+truth (e.g., Q.77–Q.79), the model still captures essential
+scene dynamics, reflecting the limits of purely visual cues
+without additional context. In theFuturistic Carscenario,
+SNOW correctly identifies static and absent entities, show-
+ing robust scene parsing even under occlusion or missing
+objects.
+Overall, these qualitative examples confirm that 4D
+STEP token integration enables SNOW to track actors and
+temporal interactions reliably, providing a strong founda-
+tion for reasoning about space, motion, and time in complex
+4D environments.9. Qualitative Examples for open-vocabulary
+LiDAR Segmentation
+Figure 7 presents qualitative results of SNOW on the
+NuScenes LiDAR segmentation task [10]. SNOW seg-
+ments single objects accurately by leveraging the spatially
+grounded 4D STEP tokens, which provide consistent ob-
+ject identities and geometry across frames without any task-
+specific training. This illustrates that the STEP represen-
+tation alone is sufficient to transfer semantic associations
+from the world knowledge of VLMs in the image domain
+into the LiDAR space.
+Smaller errors typically occur at fine object boundaries
+or in cluttered scenes with small, partially occluded in-
+stances. Since SNOW does not learn class-specific point-
+level features, it is less effective when geometric cues are
+weak or objects lack distinct volumetric separation for se-
+mantic segmentation. Nonetheless, the overall qualitative
+behavior confirms that structured 4D spatial grounding en-
+ables meaningful 3D segmentation performance even in a
+training-free setting, demonstrating the versatility and gen-
+erality of the STEP representation beyond 4D language rea-
+soning.
+10. Runtime Considerations
+Runtime is evaluated per frame on a single NVIDIA H100
+GPU using batched inference across MapAnything [22],
+SAM2 Hiera Large [41], and Gemma3-4B-IT [12]. Fig-
+ure 8 reports the end-to-end processing time as a function
+of the number of segmented objects. The dominant over-
+head arises from the VLM’s input context: as object count
+increases, the resulting 4DSGs grow and the per-frame la-
+tency rises accordingly. While the current implementation
+does not meet real-time requirements, the runtime remains
+practical for short-horizon embodied tasks that rely on 4D
+contextual reasoning and tactical scene understanding.
+2
+
+
+--- Page 14 ---
+(a) Q.033
+ (b) Q.078
+ (c) Q.097
+(d) Q.052
+ (e) Q.055
+ (f) Q.100
+(g) Q.013
+ (h) Q.101
+ (i) Q.109
+Figure 5.Qualitative examples of SNOW on RoboSpatial-Homeillustrating correct predictions (top row), ambiguous cases (middle
+row), and failure modes (bottom row). Red denotes the model prediction; Blue denotes the ground truth reference.
+ID RoboSpatial-Home Question
+Q.033 In the image, there is a fridge. Pinpoint several points within the vacant space situated to the in front of the fridge.
+Q.078 In the image, there is a painting. Pinpoint several points within the vacant space situated to the in front of the painting.
+Q.097 In the image, there is a painting. Pinpoint several points within the vacant space situated to the in front of the painting.
+Q.052 In the image, there is a bottle. Pinpoint several points within the vacant space situated to the in front of the bottle.
+Q.055 In the image, there is a sink. Pinpoint several points within the vacant space situated to the above the sink.
+Q.100 In the image, there is a cup. Pinpoint several points within the vacant space situated to the left of the cup.
+Q.013 In the image, there is a monitor. Pinpoint several points within the vacant space situated to the in front of the monitor.
+Q.101 In the image, there is a tissue. Pinpoint several points within the vacant space situated to the left of the tissue.
+Q.109 In the image, there is a litter box. Pinpoint several points within the vacant space situated to the in front of the litter box.
+Table 7.RoboSpatial-Home question formulationsfor the spatial pinpointing task examples shown in Figure 5. We provide these to
+clarify success, failure, and cases where ambiguity in spatial phrasing may influence evaluation outcomes.
+3
+
+
+--- Page 15 ---
+(a) Curling (Exo-centric)
+(b) Burnout (Exo-centric)
+(c) Desk (Ego-centric)
+(d) Futuristic Car(Synthetic)
+Figure 6.Qualitative examples of SNOW on the VLM4D benchmarkacross exo-centric, ego-centric, and synthetic videos. Each
+example displays samples of one video trace alongside its question, ground truth and predicted answer provided in Table 8 to illustrate
+correct and failure cases of SNOW.
+4
+
+
+--- Page 16 ---
+Scenario ID VLM4D Question Ground Truth SNOW’s Answer
+CurlingQ.182 How many people are moving to the right on the ice
+rink?3 3
+Q.184 From the camera perspective, which direction is the
+curling team moving towards?right right
+Q.186 How many people are sweeping in front of the moving
+curling stone?2 2
+BurnoutQ.77 Is the car spinning clockwise or counter-clockwise? counter-clockwise clockwise
+Q.78 From the camera perspective, what direction is the car
+moving towards?left right
+Q.79 From the cars perspective, is it turning to the left or
+right?left right
+Q.80 Which direction is the crowd in the background moving
+towards?not moving not moving
+DeskQ.1242 What does the left hand do? pick up the phone pick up the phone
+Q.1243 What does the right hand do? hold the phone hold the phone
+Q.1244 What direction is the table moving? not moving not moving
+Futuristic CarQ.61 What direction is the fairy moving towards? no fairy there no fairy there
+Q.62 What direction is the taxi moving towards? left no taxi there
+Table 8.Question formulations on VLM4Dcorresponding to video traces in Figure 6. For each scenario we select representative
+questions to qualitatively illustrate the answers of SNOW.
+Figure 7.Qualitative examples of SNOW on the NuScenes LiDAR segmentation taskillustrating examples across diverse scenes,
+weather, and daylight conditions.
+5
+
+
+--- Page 17 ---
+0 20 40 60 80 100 120 140 16012345678910
+Number of ObjectsRuntime (s)Figure 8.Runtime scaling of SNOWas a function of the number
+of integrated segmentation masks. The curve illustrates how in-
+creasing mask density impacts computational cost under identical
+inference settings.
+6

@@ -1,0 +1,10 @@
+name: vlm4d
+root: data/VLM4D-main
+annotations:
+  real_mc: data/VLM4D-main/data/real_mc.json
+  synthetic_mc: data/VLM4D-main/data/synthetic_mc.json
+video:
+  local_root: ""
+  allow_remote: true
+filters:
+  question_type: multiple-choice
