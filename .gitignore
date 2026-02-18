@@ -39,6 +39,3 @@ fast_snow/vision/third_party/
 
 # Cloned model repos (pull via bootstrap script)
 fast_snow/data/MapAnything/
-fast_snow/vision/sam3/
-fast_snow/vision/da3/
-fast_snow/vision/recognize-anything/
