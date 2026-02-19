@@ -1,15 +1,10 @@
 """VLM4D benchmark evaluation.
 
-This module implements evaluation on the VLM4D benchmark as described in
-SNOW paper Section 4.2, Table 3.
-
 VLM4D categories:
 - Ego-centric: Spatial reasoning from ego perspective
 - Exo-centric: Spatial reasoning from external perspective
 - Directional: Direction-based reasoning
 - False Positive: Detection of false positives
-
-SNOW achieves 73.75% overall accuracy on VLM4D.
 """
 
 from __future__ import annotations
@@ -269,51 +264,6 @@ def evaluate_vlm4d(
         logger.info(f"Saved predictions to {save_predictions}")
 
     return metrics
-
-
-def evaluate_vlm4d_with_snow(
-    json_path: Path,
-    snow_pipeline: Any,  # SNOWPipeline
-    vlm: Any,  # VLMInterface
-    local_video_root: Optional[Path] = None,
-    max_samples: Optional[int] = None,
-) -> VLM4DMetrics:
-    """Run VLM4D evaluation using SNOW pipeline.
-
-    This is a convenience function that integrates the SNOW pipeline
-    with VLM4D evaluation.
-
-    Args:
-        json_path: Path to VLM4D JSON file
-        snow_pipeline: Configured SNOW pipeline
-        vlm: VLM interface for inference
-        local_video_root: Optional local video directory
-        max_samples: Optional sample limit
-
-    Returns:
-        VLM4DMetrics
-    """
-    from fast_snow.reasoning.vlm.prompt_builder import build_messages, PromptConfig
-
-    def inference_fn(question: str, choices: Dict[str, str], video_path: str) -> str:
-        # Process video with SNOW pipeline
-        # This should extract frames, run MapAnything, build 4DSG
-        four_dsg = snow_pipeline.process_video(video_path)
-
-        # Build prompt
-        messages = build_messages(question, four_dsg, PromptConfig())
-
-        # Run VLM inference
-        response = vlm.generate(messages)
-
-        return response
-
-    return evaluate_vlm4d(
-        json_path=json_path,
-        inference_fn=inference_fn,
-        local_video_root=local_video_root,
-        max_samples=max_samples,
-    )
 
 
 # VLM4D question type constants

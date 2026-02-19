@@ -1,47 +1,37 @@
-"""SNOW Configuration System.
-
-This module provides a unified configuration system for the SNOW pipeline.
-Configuration can be loaded from YAML files or created programmatically.
+"""Fast-SNOW Configuration System.
 
 Usage:
-    from fast_snow.engine.config import load_config, SNOWConfig
+    from fast_snow.engine.config import FastSNOWConfig, load_fast_snow_config
 
-    # Load from YAML
-    config = load_config("configs/default.yaml")
-
-    # Access components
-    print(config.perception.hdbscan.min_cluster_size)
-    print(config.vlm.model_name)
+    config = load_fast_snow_config("configs/default.yaml")
 """
 
-from fast_snow.engine.config.snow_config import (
-    SNOWConfig,
-    PerceptionConfig,
-    HDBSCANConfig,
-    SAM2Config,
-    RefinementConfig,
-    HHopConfig,
-    SLAMConfig,
-    GraphConfig,
-    TrackerConfig,
-    VLMConfig,
-    EvalConfig,
-    load_config,
-    save_config,
+from fast_snow.engine.config.fast_snow_config import (
+    FastSNOWConfig,
+    SAM3Config,
+    DA3Config,
+    RAMPlusConfig,
+    SamplingConfig,
+    DepthFilterConfig,
+    FusionConfig,
+    STEPConfig,
+    EdgeConfig,
+    SerializationConfig,
+    load_fast_snow_config,
+    save_fast_snow_config,
 )
 
 __all__ = [
-    "SNOWConfig",
-    "PerceptionConfig",
-    "HDBSCANConfig",
-    "SAM2Config",
-    "RefinementConfig",
-    "HHopConfig",
-    "SLAMConfig",
-    "GraphConfig",
-    "TrackerConfig",
-    "VLMConfig",
-    "EvalConfig",
-    "load_config",
-    "save_config",
+    "FastSNOWConfig",
+    "SAM3Config",
+    "DA3Config",
+    "RAMPlusConfig",
+    "SamplingConfig",
+    "DepthFilterConfig",
+    "FusionConfig",
+    "STEPConfig",
+    "EdgeConfig",
+    "SerializationConfig",
+    "load_fast_snow_config",
+    "save_fast_snow_config",
 ]

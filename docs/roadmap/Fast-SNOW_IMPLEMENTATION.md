@@ -48,7 +48,8 @@ Frame I_t 到达（单 GPU 流式）
 
 ### Step 0. Sampling & Scheduling
 - 输入：视频帧 `I_t`，`t=0..T-1`。
-- 默认每帧处理（`stride=1`），必要时降采样。
+- 默认按 `target_fps=10.0`（10 Hz）做时间采样（每秒约 10 帧）。
+- `max_frames` 可选：用于截断窗口长度（例如调试或固定预算）。
 
 **帧调度模型**（单 GPU 流式处理）：
 ```
@@ -61,7 +62,7 @@ Frame t 到达
  └─ CPU: backproject + STEP + SG update          [与下一帧 GPU 重叠, ~5-10ms]
 ```
 - 三个模型权重常驻同一 GPU，按时分复用顺序执行（DA3 → SAM3 runs → RAM++）。
-- RAM++ 每帧执行——帧间隔可达 1s+，每帧场景变化显著，不能跳帧。
+- RAM++ / DA3 / SAM3 在**采样帧**上逐帧执行（默认 10 Hz）。
 - CPU 工作（Step 4-7）与下一帧的 GPU 推理异步重叠。
 - VLM 推理不在实时循环中，按查询按需触发。
 
@@ -146,7 +147,7 @@ Run 生命周期（自然增长）：
 **Mask 去重算法**（帧级后处理）：
 
 ```
-每帧处理完所有 run 的 mask 后：
+每个采样帧处理完所有 run 的 mask 后：
 1. 收集所有 run 的 (run_id, obj_id_local, mask, score) → candidates
 2. 按 score 降序排列
 3. 对所有 candidate pairs (i, j) where i.run_id ≠ j.run_id：
@@ -180,7 +181,7 @@ Run 生命周期（自然增长）：
 S_t^k = {τ_{k,1}^t, ..., τ_{k,m}^t,  c_t^k,  s_t^k,  θ_t^k}
 ```
 
-1. **patch_tokens (τ)**：在原图上将 mask 内像素着色 → 整张图按 16×16 grid 划分 → 每个 cell 算与 mask 的 IoU → 保留 IoU > 0.5 的 cell → 输出 `list[(row, col, iou)]`。
+1. **patch_tokens (τ)**：在原图上将 mask 内像素着色 → 整张图按 16×16 grid 划分 → 每个 cell 计算覆盖率 `intersection / cell_area`（字段名仍记为 `iou`）→ 保留覆盖率 > 0.5 的 cell → 输出 `list[(row, col, iou)]`。
 2. **centroid_token (c)**：直接取 Step 4 计算的 `centroid_xyz = (x̄, ȳ, z̄)`。
 3. **shape_token (s)**：直接取 Step 4 计算的每轴统计 `(μ, σ, min, max) × 3`，共 12 维。
 4. **temporal_token (θ)**：初始 `(t, t)`；Step 7 中按 track 更新为 `(t_start, t_end)`。
@@ -287,7 +288,6 @@ S_t^k = {τ_{k,1}^t, ..., τ_{k,m}^t,  c_t^k,  s_t^k,  θ_t^k}
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `max_obj_relations` | 20 | object-object 边最大数 |
-| `motion_window` | 3 | 计算 motion 所需的最近帧数 |
 
 **不做截断 / 不做量化**（严格 STEP 合规）：
 - **F_k 不截断**：窗口内每帧 `S_t^k` 全保留，不做 "最近 N 帧" 子采样。`F_k` 长度 = 该 track 在窗口内的实际可见帧数。
@@ -340,7 +340,7 @@ S_t^k = {τ_{k,1}^t, ..., τ_{k,m}^t,  c_t^k,  s_t^k,  θ_t^k}
 
 | STEP 组件 | SNOW 定义 | JSON 字段 | 说明 |
 |-----------|----------|----------|------|
-| **τ** (patch) | `list[(row, col, iou)]` | `tau: [{row, col, iou}, ...]` | 16×16 grid 中 IoU > 0.5 的 cell，**保留 iou 值**，**每帧每对象都有** |
+| **τ** (patch) | `list[(row, col, iou)]` | `tau: [{row, col, iou}, ...]` | 16×16 grid 中覆盖率 `intersection / cell_area` > 0.5 的 cell，**保留 iou 字段值**，**每帧每对象都有** |
 | **c** (centroid) | `(x̄, ȳ, z̄)` | `c: [x, y, z]` | 3D 质心（= shape μ） |
 | **s** (shape) | `(μ, σ, min, max) × 3`，共 12 维 | `s: {x: {mu,sigma,min,max}, y: {...}, z: {...}}` | 每轴 Gaussian 统计 + 极值，**完整保留** |
 | **θ** (temporal) | `(t_start, t_end)` | `theta: [t_start, t_end]` | track 级时间跨度 |
@@ -366,7 +366,7 @@ VLM 最常回答 ego 视角问题（"前方有什么"、"左边的车离我多�
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `id` | int | 物体 graph index |
+| `object_id` | int | 物体 graph index |
 | `bearing` | str | ego 视角方位角，8 方向（见下表） |
 | `elev` | str | 垂直关系：above / level / below（\|dz\| > 0.5m） |
 | `dist_m` | float | ego 到物体 centroid 的欧氏距离 |
@@ -404,7 +404,10 @@ bearing = quantize_to_8_sectors(angle)          # 按 45° 量化
 **Motion 计算**（需最近 N 帧数据，N ≥ 2）：
 ```
 dist_history = [||obj_pos_t - ego_pos_t|| for t in recent_N_frames]
-rate = (dist_history[-1] - dist_history[0]) / N
+lat_history  = [lateral_pos_t for t in recent_N_frames]   # ego frame 横向分量
+dt = max(1, t_history[-1] - t_history[0])                 # 用帧间隔归一化
+rate = (dist_history[-1] - dist_history[0]) / dt
+lateral_change = abs(lat_history[-1] - lat_history[0]) / dt
 if rate < -threshold:  "approaching"       # 距离在缩小
 elif rate > threshold:  "receding"          # 距离在增大
 elif lateral_change > threshold: "lateral"  # 距离不变但横向位移大
@@ -507,6 +510,13 @@ fast_snow/
 
 所有可调参数集中在此，pipeline 各 Step 引用此表的变量名。
 
+### 6.0 采样与调度
+
+| 参数 | 默认值 | 来源 Step | 说明 |
+|------|--------|-----------|------|
+| `target_fps` | 10.0 (Hz) | Step 0 | 时间采样频率，默认每秒约 10 帧 |
+| `max_frames` | `None` | Step 0 | 可选帧数上限；达到上限后停止采样 |
+
 ### 6.1 SAM3 检测
 
 | 参数 | 默认值 | 来源 Step | 说明 |
@@ -536,7 +546,7 @@ fast_snow/
 | 参数 | 默认值 | 来源 Step | 说明 |
 |------|--------|-----------|------|
 | `grid_size` | 16 | Step 6 | patch token 网格尺寸（16×16 = 256 cells） |
-| `iou_threshold` | 0.5 | Step 6 | 网格 cell 与 mask 的 IoU 阈值，低于此值不保留 |
+| `iou_threshold` | 0.5 | Step 6 | 网格 cell 覆盖率阈值（`intersection / cell_area`，字段沿用 `iou` 命名），低于此值不保留 |
 
 ### 6.5 SG 边计算
 
@@ -546,13 +556,13 @@ fast_snow/
 | `motion_thresh` | 0.3 (m/帧) | Step 7 | 距离变化率阈值，区分 approaching/receding/static |
 | `lateral_thresh` | 0.3 (m/帧) | Step 7 | 横向位移阈值，区分 lateral/static |
 | `knn_k` | 3 | Step 7 | object-object 边 kNN 参数 |
+| `motion_window` | 3 (帧) | Step 7 | 计算 motion 所需的最近帧数（历史不足时输出 `"unknown"`） |
 
 ### 6.6 序列化 & VLM
 
 | 参数 | 默认值 | 来源 Step | 说明 |
 |------|--------|-----------|------|
 | `max_obj_relations` | 20 | Step 8 | object-object 边最大数 |
-| `motion_window` | 3 (帧) | Step 8 | 计算 motion 所需的最近帧数 |
 
 不设置 `max_tracks` 硬限制：track 全量保留，必要时通过缩短时间窗口或多轮分块查询控制上下文长度。
 
@@ -577,3 +587,13 @@ fast_snow/
 3. VLM 精度：同一问答集上，Fast-SNOW 相对 SNOW 的 absolute accuracy 下降不超过 3%。
 4. 速度：报告 `fps` 与 `p50/p95 latency`，并显著优于 SNOW 的 ~1.1 FPS。
 5. 可复现性：固定随机种子、模型版本和配置文件，重复 3 次方差可控。
+
+---
+
+## API Breaking Changes
+
+| 日期 | 变更 | 影响 |
+|------|------|------|
+| 2026-02-19 | `SamplingConfig` 从 `stride` 语义改为 `target_fps`（默认 10.0 Hz） | 旧配置 `sampling.stride` 将不再生效；请改为 `sampling.target_fps`，并可选设置 `sampling.max_frames`。 |
+| 2026-02-19 | `build_4dsg_from_video()` 返回类型从 `Tuple[Dict, str]` 改为 `FastSNOW4DSGResult` 对象 | 旧代码 `dsg, json_str = e2e.build_4dsg_from_video(...)` 需改为 `result = e2e.build_4dsg_from_video(...)`，通过 `result.four_dsg_dict` / `result.scene_json` 访问，并在使用完后调用 `result.cleanup()` 释放临时关键帧目录。 |
+| 2026-02-19 | `_extract_frames()` 返回值从 3-tuple 变为 4-tuple（新增 `keyframe_paths`） | 内部方法，外部不应直接调用。若有调用需按 `frames, frame_dir, source_indices, keyframe_paths = ...` 解包。 |

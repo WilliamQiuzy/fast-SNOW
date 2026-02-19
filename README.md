@@ -72,4 +72,7 @@ mkdir -p "$HF_HOME"
 ## 6) Current Status
 
 - Roadmap is defined and being refined in `docs/roadmap/Fast-SNOW_IMPLEMENTATION.md`.
-- Engineering implementation is modular and can be developed step-by-step by component owners.
+- `SNOWPipeline` (legacy) is still available for baseline reproduction.
+- New `FastSNOWPipeline` is available at `fast_snow.engine.pipeline.fast_snow_pipeline`:
+  - consumes per-frame DA3 outputs (`depth_t`, `K_t`, `T_wc_t`) + SAM3 detections,
+  - implements Step 4/5/6/7/8 (3D state, global ID fusion, STEP, 4DSG, strict JSON).

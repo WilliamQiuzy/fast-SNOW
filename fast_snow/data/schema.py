@@ -45,6 +45,13 @@ class FrameData:
         default_factory=lambda: np.eye(4, dtype=np.float64)
     )
 
+    # Fast-SNOW fields (monocular depth pipeline) ---------------------------
+    image: Optional[np.ndarray] = None           # (H, W, 3) single RGB frame
+    depth_map: Optional[np.ndarray] = None        # (H, W) metric depth from DA3
+    depth_conf: Optional[np.ndarray] = None       # (H, W) per-pixel confidence
+    intrinsics: Optional[np.ndarray] = None       # (3, 3) camera intrinsics K
+    T_wc: Optional[np.ndarray] = None             # (4, 4) world-to-camera transform
+
     # -- helpers -------------------------------------------------------------
 
     def load_image(self, camera_id: str) -> np.ndarray:
