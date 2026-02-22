@@ -11,22 +11,14 @@ from fast_snow.engine.config.fast_snow_config import FastSNOWConfig
 from fast_snow.engine.pipeline.fast_snow_e2e import FastSNOWEndToEnd
 
 
-def test_step1_tag_normalization_and_new_tag_logic():
+def test_fastsam_config_defaults():
     cfg = FastSNOWConfig()
-    cfg.ram_plus.normalize_lowercase = True
-    cfg.ram_plus.deduplicate_tags = True
-
-    e2e = FastSNOWEndToEnd(cfg)
-
-    tags = e2e._normalize_tags([" Car ", "tree", "car", "", " TREE ", "person"])
-    assert tags == ["car", "tree", "person"]
-
-    global_tag_set = {"car"}
-    new_tags = [t for t in tags if t not in global_tag_set]
-    global_tag_set.update(new_tags)
-
-    assert new_tags == ["tree", "person"]
-    assert global_tag_set == {"car", "tree", "person"}
+    assert cfg.fastsam.model_path == "fast_snow/models/fastsam/FastSAM-s.pt"
+    assert cfg.fastsam.conf_threshold == 0.55
+    assert cfg.fastsam.iou_threshold == 0.9
+    assert cfg.fastsam.imgsz == 640
+    assert cfg.fastsam.max_det == 200
+    assert cfg.fastsam.discovery_iou_thresh == 0.3
 
 
 def test_step0_sampling_target_fps_and_max_frames():
@@ -54,7 +46,7 @@ def test_step0_sampling_target_fps_and_max_frames():
         cfg.sampling.max_frames = 2
         e2e = FastSNOWEndToEnd(cfg)
 
-        frames, frame_dir, source_indices, keyframe_paths = e2e._extract_frames(video_path)
+        frames, frame_dir, source_indices, keyframe_paths, timestamps_s = e2e._extract_frames(video_path)
         try:
             assert len(frames) == 2
             assert source_indices == [0, 2]
@@ -67,5 +59,9 @@ def test_step0_sampling_target_fps_and_max_frames():
             assert keyframe_paths[1][0] == 2
             assert keyframe_paths[0][1].exists()
             assert keyframe_paths[1][1].exists()
+
+            # timestamps_s must be provided
+            assert len(timestamps_s) == 2
+            assert timestamps_s[0] == pytest.approx(0.0, abs=0.01)
         finally:
             shutil.rmtree(frame_dir, ignore_errors=True)

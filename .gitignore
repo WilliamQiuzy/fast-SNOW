@@ -16,11 +16,26 @@ __pycache__/
 venv/
 env/
 .venv_mapanything/
+.env
 
 # Runtime outputs
 results/
 outputs/
 logs/
+
+# assets: ignore all subdirectories EXCEPT examples_videos
+# (individual .py / .png files in assets/ root are kept)
+assets/*/
+!assets/examples_videos/
+
+# Benchmark data (cloned public repos — clone locally via instructions in README)
+benchmark/VLM4D/
+benchmark/VLM4D-video/
+benchmark/DSR-Bench/
+
+# Video cache (may be a symlink or directory)
+video_cache
+video_cache/
 
 # Local data / checkpoints
 fast_snow/models/
@@ -37,5 +52,13 @@ data/vlm4d_videos/
 # Optional local clones/cache (if users place extra repos)
 fast_snow/vision/third_party/
 
-# Cloned model repos (pull via bootstrap script)
+# Cloned model repos (pull via bootstrap script / README instructions)
 fast_snow/data/MapAnything/
+fast_snow/vision/sam3/
+fast_snow/vision/sam2/
+fast_snow/vision/da3/
+fast_snow/vision/Video-Depth-Anything/
+fast_snow/vision/recognize-anything/
+
+# YOLO auto-downloaded weights
+yolo11n.pt

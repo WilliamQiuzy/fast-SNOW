@@ -1,0 +1,2 @@
+Model (JSON File),Real Ego-centric Accuracy (%),Real Exo-centric Accuracy (%),Real Overall Accuracy (%),Synthetic Directional Accuracy (%),Synthetic FP Accuracy (%),Synthetic Overall Accuracy (%),Overall Accuracy (%)
+gpt-5.2_10hz.json,73.94,71.8,72.5,66.25,73.33,66.97,71.15

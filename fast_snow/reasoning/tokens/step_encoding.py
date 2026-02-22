@@ -4,16 +4,20 @@ Paper reference (Section 3.2, Eq. 4):
     S_t^k = {τ_{k,1}^t, ..., τ_{k,m}^t, c_t^k, s_t^k, θ_t^k}
 
     Where:
-    - τ: Image patch tokens (16×16 grid, IoU > 0.5)
+    - τ: Image patch tokens (16×16 grid, IoU > 0.5) — actual masked image crops
     - c: Centroid token (3D center)
     - s: Shape token (Gaussian statistics + extents)
     - θ: Temporal token (t_start, t_end)
+
+The patch tokens τ are **visual tokens**: actual image regions cropped from the
+masked image, not mere (row, col, iou) metadata.  They are fed to the VLM's
+vision encoder so it can infer the object's semantic category.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
@@ -22,20 +26,20 @@ from fast_snow.reasoning.tokens.patch_tokenizer import PatchToken, mask_to_patch
 from fast_snow.reasoning.tokens.temporal_tokens import TemporalToken
 
 
-@dataclass(frozen=True)
+@dataclass
 class STEPToken:
     """Spatio-Temporal Tokenized Patch Encoding for a single object instance.
 
     This compact multimodal representation captures:
-    - Semantic: image patch tokens (localized visual features)
-    - Geometric: centroid + shape tokens (3D structure)
-    - Temporal: appearance/disappearance timestamps (track-level)
+    - Semantic: image patch tokens (masked image crops → VLM vision input)
+    - Geometric: centroid + shape tokens (3D structure → VLM text input)
+    - Temporal: appearance/disappearance timestamps (track-level → VLM text input)
 
     Attributes:
-        patch_tokens: List of (row, col, iou) for 16×16 grid cells with IoU ≥ 0.5
-        centroid: 3D center (x̄, ȳ, z̄) from Phase 3 mask-assigned points
-        shape: Gaussian statistics (μ, σ, min, max) × 3 axes
-        temporal: (t_start, t_end) track-level timestamps
+        patch_tokens: List of PatchToken, each with (row, col, iou, image_crop).
+        centroid: 3D center (x, y, z) from backprojected mask points.
+        shape: Gaussian statistics (mu, sigma, min, max) x 3 axes.
+        temporal: (t_start, t_end) track-level timestamps.
     """
     patch_tokens: List[PatchToken]
     centroid: CentroidToken
@@ -50,32 +54,43 @@ def build_step_token(
     t_end: int,
     grid_size: int = 16,
     iou_threshold: float = 0.5,
+    image: Optional[np.ndarray] = None,
+    mask_outside: bool = True,
+    crop_size: Optional[int] = None,
 ) -> STEPToken:
     """Build STEP tokens for a single object instance.
 
     Paper workflow (Section 3.2):
-    1. Partition mask into 16×16 grid
-    2. Retain cells with IoU > 0.5 as patch tokens
-    3. Compute centroid from 3D points
-    4. Compute shape token (Gaussian + extents)
-    5. Attach temporal token (t_start, t_end)
+    1. Isolate masked image (zero out non-mask pixels)
+    2. Partition into 16x16 grid
+    3. Retain cells with IoU > 0.5 as image patch tokens
+    4. Compute centroid from 3D points
+    5. Compute shape token (Gaussian + extents)
+    6. Attach temporal token (t_start, t_end)
 
     Args:
-        mask: (H, W) boolean mask from SAM2 segmentation.
-        points_xyz: (N, 3) 3D points from Phase 3 (mask-assigned points).
-        t_start: First appearance frame (Phase 4: current frame; Phase 6: track start).
-        t_end: Last appearance frame (Phase 4: current frame; Phase 6: track end).
+        mask: (H, W) boolean mask from SAM segmentation.
+        points_xyz: (N, 3) 3D points from backprojection.
+        t_start: First appearance frame.
+        t_end: Last appearance frame.
         grid_size: Grid dimension (default 16 for 256 patches).
         iou_threshold: Minimum IoU to retain patch (default 0.5).
+        image: (H, W, 3) uint8 RGB image.  When provided, patch tokens will
+            include actual image crops (the paper's "image patch tokens").
+        mask_outside: Zero out non-mask pixels within each cell crop.
+        crop_size: Resize each crop to (crop_size, crop_size); None = native.
 
     Returns:
         STEPToken with all components initialized.
-
-    Note:
-        In Phase 4, t_start = t_end = frame_idx (single-frame placeholder).
-        In Phase 6, tracker updates temporal token to reflect true track span.
     """
-    patch_tokens = mask_to_patch_tokens(mask, grid_size=grid_size, iou_threshold=iou_threshold)
+    patch_tokens = mask_to_patch_tokens(
+        mask,
+        grid_size=grid_size,
+        iou_threshold=iou_threshold,
+        image=image,
+        mask_outside=mask_outside,
+        crop_size=crop_size,
+    )
     centroid = build_centroid_token(points_xyz)
     shape = build_shape_token(points_xyz)
     temporal = TemporalToken(t_start=t_start, t_end=t_end)
@@ -94,24 +109,12 @@ def update_temporal_token(
 ) -> STEPToken:
     """Update temporal token with track-level timestamps.
 
-    This is called in Phase 6 after cross-frame association to replace
-    the single-frame placeholder temporal token with true track-level timestamps.
-
-    Args:
-        step: Original STEPToken with placeholder temporal token.
-        t_start: First frame of the track.
-        t_end: Last frame of the track.
-
-    Returns:
-        New STEPToken with updated temporal token (all other fields unchanged).
-
-    Example:
-        # Phase 4: Create with placeholder
-        step = build_step_token(mask, points, t_start=5, t_end=5, ...)
-
-        # Phase 6: Update with track-level timestamps
-        updated_step = update_temporal_token(step, t_start=3, t_end=8)
-        assert updated_step.temporal.t_start == 3
-        assert updated_step.temporal.t_end == 8
+    Called after cross-frame association to replace single-frame placeholder
+    temporal tokens with the true track-level span.
     """
-    return replace(step, temporal=TemporalToken(t_start=t_start, t_end=t_end))
+    return STEPToken(
+        patch_tokens=step.patch_tokens,
+        centroid=step.centroid,
+        shape=step.shape,
+        temporal=TemporalToken(t_start=t_start, t_end=t_end),
+    )

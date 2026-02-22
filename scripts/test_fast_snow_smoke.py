@@ -5,12 +5,10 @@ Verifies Steps 4-8:
   - Backprojection from mock masks + depth
   - Global ID fusion (cross-run dedup)
   - STEP token construction
-  - Scene graph relations (ego-object + object-object)
   - 4DSG JSON serialization (strict spec compliance)
 """
 
 import json
-import math
 import sys
 import tempfile
 from pathlib import Path
@@ -97,7 +95,7 @@ def test_single_frame():
 
     print(f"  Tracks: {result['metadata']['num_tracks']}")
     print(f"  Centroid: {obs['c']}")
-    print(f"  Patches: {len(obs['tau'])}")
+    print(f"  Tau: {len(obs['tau'])}")
     print("  PASSED")
 
 
@@ -232,36 +230,7 @@ def test_multiple_objects():
         f"Expected 3 tracks, got {result['metadata']['num_tracks']}"
     )
 
-    # Verify ego_relations exist for all objects
-    assert len(result["ego_relations"]) == 3, (
-        f"Expected 3 ego relations, got {len(result['ego_relations'])}"
-    )
-
-    # Verify each ego relation has required fields
-    for rel in result["ego_relations"]:
-        assert "object_id" in rel
-        assert "bearing" in rel
-        assert "elev" in rel
-        assert "dist_m" in rel
-        assert "motion" in rel
-        assert rel["bearing"] in [
-            "front", "front-left", "left", "back-left",
-            "back", "back-right", "right", "front-right",
-        ]
-        assert rel["elev"] in ["above", "below", "level"]
-
-    # Verify object_relations
-    assert len(result["object_relations"]) > 0, "Expected some object-object relations"
-    for rel in result["object_relations"]:
-        assert "src" in rel
-        assert "dst" in rel
-        assert "dir" in rel
-        assert "elev" in rel
-        assert "dist_m" in rel
-
     print(f"  Tracks: {result['metadata']['num_tracks']}")
-    print(f"  Ego relations: {len(result['ego_relations'])}")
-    print(f"  Object relations: {len(result['object_relations'])}")
     print("  PASSED")
 
 
@@ -295,7 +264,7 @@ def test_json_schema_compliance():
     result = json.loads(json_str)
 
     # Top-level keys
-    required_keys = {"metadata", "ego", "tracks", "ego_relations", "object_relations"}
+    required_keys = {"metadata", "ego", "tracks"}
     assert set(result.keys()) == required_keys, f"Top-level keys: {set(result.keys())} != {required_keys}"
 
     # Metadata
@@ -321,7 +290,7 @@ def test_json_schema_compliance():
             assert "s" in obs
             assert "theta" in obs
 
-            # tau items
+            # patches items
             for patch in obs["tau"]:
                 assert "row" in patch
                 assert "col" in patch
@@ -338,14 +307,6 @@ def test_json_schema_compliance():
 
             # theta = [t_start, t_end]
             assert len(obs["theta"]) == 2
-
-    # Ego relations
-    for rel in result["ego_relations"]:
-        assert set(rel.keys()) == {"object_id", "bearing", "elev", "dist_m", "motion"}
-
-    # Object relations
-    for rel in result["object_relations"]:
-        assert set(rel.keys()) == {"src", "dst", "dir", "elev", "dist_m"}
 
     print(f"  JSON valid, {len(json_str)} chars")
     print(f"  Tracks: {result['metadata']['num_tracks']}")
@@ -687,91 +648,6 @@ def test_archived_track_not_reactivated():
     print("  PASSED (archived track NOT reactivated)")
 
 
-def test_motion_cold_start_and_rate():
-    """Motion must be 'unknown' when history < motion_window (spec §7).
-
-    Also verifies rate denominator is dt (time gap), not N (sample count).
-    """
-    print("\n=== Test: Motion cold start + dt-normalized rate ===")
-
-    config = FastSNOWConfig()
-    config.edge.motion_window = 3
-    config.edge.motion_thresh = 0.3
-    config.edge.lateral_thresh = 0.3
-    pipeline = FastSNOWPipeline(config)
-
-    H, W = 480, 640
-    K = make_identity_intrinsics()
-    mask = make_mask(H, W, y0=100, y1=200, x0=200, x1=350)
-
-    def _frame(t, ego_x=0.0):
-        T_wc = np.eye(4, dtype=np.float64)
-        T_wc[0, 3] = ego_x
-        depth = make_depth_map(H, W, base_depth=5.0)
-        return FastFrameInput(
-            frame_idx=t,
-            depth_t=depth,
-            K_t=K,
-            T_wc_t=T_wc,
-            detections=[
-                FastLocalDetection(run_id=0, local_obj_id=0, mask=mask, score=0.9),
-            ],
-        )
-
-    # Frame 0: 1 sample → unknown (< motion_window=3)
-    pipeline.process_frame(_frame(0, ego_x=0.0))
-    r0 = pipeline.build_4dsg_dict()
-    m0 = r0["ego_relations"][0]["motion"]
-    assert m0 == "unknown", f"1 sample: expected 'unknown', got '{m0}'"
-
-    # Frame 1: 2 samples → still unknown (< motion_window=3)
-    pipeline.process_frame(_frame(1, ego_x=0.0))
-    r1 = pipeline.build_4dsg_dict()
-    m1 = r1["ego_relations"][0]["motion"]
-    assert m1 == "unknown", f"2 samples: expected 'unknown', got '{m1}'"
-
-    # Frame 2: 3 samples → now can infer (= motion_window)
-    pipeline.process_frame(_frame(2, ego_x=0.0))
-    r2 = pipeline.build_4dsg_dict()
-    m2 = r2["ego_relations"][0]["motion"]
-    assert m2 != "unknown", f"3 samples: should NOT be 'unknown', got '{m2}'"
-
-    print(f"  1 sample → '{m0}' (cold start)")
-    print(f"  2 samples → '{m1}' (still cold start)")
-    print(f"  3 samples → '{m2}' (motion_window met)")
-
-    # --- Rate denominator: dt vs N discriminating test ---
-    # Object approaches ego: depth decreases 10 → 9 → 8 across strided frames.
-    # ego-object distance Δ ≈ -2.0m over the 3 samples.
-    #   dt-based (correct):  rate = -2.0 / 20 = -0.10 → |rate| < 0.3 → "static"
-    #   N-based (old impl):  rate = -2.0 / 3 ≈ -0.67 → |rate| > 0.3 → "approaching"
-    config3 = FastSNOWConfig()
-    config3.edge.motion_window = 3
-    config3.edge.motion_thresh = 0.3
-    config3.edge.lateral_thresh = 0.3
-    pipeline3 = FastSNOWPipeline(config3)
-
-    depths = [10.0, 9.0, 8.0]
-    strided_ts = [0, 10, 20]
-    for t, d in zip(strided_ts, depths):
-        T_wc = np.eye(4, dtype=np.float64)
-        depth = make_depth_map(H, W, base_depth=d)
-        frame = FastFrameInput(
-            frame_idx=t, depth_t=depth, K_t=K, T_wc_t=T_wc,
-            detections=[FastLocalDetection(run_id=0, local_obj_id=0, mask=mask, score=0.9)],
-        )
-        pipeline3.process_frame(frame)
-
-    r3 = pipeline3.build_4dsg_dict()
-    motion_strided = r3["ego_relations"][0]["motion"]
-    # With dt denominator this must be "static"; with N it would be "approaching".
-    assert motion_strided == "static", (
-        f"Strided depth 10→8: expected 'static' (rate/dt), got '{motion_strided}'"
-    )
-    print(f"  Strided depth 10→8 (t=0,10,20) → '{motion_strided}' (rate/dt, not rate/N)")
-    print("  PASSED")
-
-
 def test_merge_deduplicates_observations():
     """Cross-run fusion merge must not create duplicate per-frame observations.
 
@@ -1042,6 +918,129 @@ def test_result_cleanup():
     print("  PASSED")
 
 
+def test_temporal_window_trims_fk():
+    """F_k sliding window: only the most recent T observations are serialized.
+
+    SNOW §4.2 uses T=10.  theta (track lifespan) must still reflect the
+    full history, not just the windowed observations.
+    """
+    print("\n=== Test: Temporal window trims F_k ===")
+
+    config = FastSNOWConfig()
+    config.step.temporal_window = 3  # Small window for testing
+    pipeline = FastSNOWPipeline(config)
+
+    H, W = 480, 640
+    K = make_identity_intrinsics()
+
+    # Feed 6 frames (more than window=3) with the same object
+    for t in range(6):
+        T_wc = np.eye(4, dtype=np.float64)
+        depth = make_depth_map(H, W, base_depth=5.0)
+        mask = make_mask(H, W, y0=100, y1=200, x0=200, x1=350)
+        frame = FastFrameInput(
+            frame_idx=t,
+            depth_t=depth,
+            K_t=K,
+            T_wc_t=T_wc,
+            detections=[
+                FastLocalDetection(run_id=0, local_obj_id=0, mask=mask, score=0.9),
+            ],
+        )
+        pipeline.process_frame(frame)
+
+    result = pipeline.build_4dsg_dict()
+    track = result["tracks"][0]
+    fk = track["F_k"]
+
+    # F_k should contain only the last 3 frames (window=3)
+    assert len(fk) == 3, (
+        f"Expected 3 observations (window=3), got {len(fk)}"
+    )
+    obs_ts = [obs["t"] for obs in fk]
+    assert obs_ts == [3, 4, 5], (
+        f"Expected most recent frames [3,4,5], got {obs_ts}"
+    )
+
+    # theta must still reflect the FULL track lifespan [0, 5]
+    theta = fk[0]["theta"]
+    assert theta == [0, 5], (
+        f"theta should span full track [0,5], got {theta}"
+    )
+
+    # Ego entries are NOT windowed (all 6 frames)
+    assert len(result["ego"]) == 6, (
+        f"Ego should have all 6 frames, got {len(result['ego'])}"
+    )
+
+    print(f"  6 frames, window=3 → F_k has {len(fk)} entries: {obs_ts}")
+    print(f"  theta={theta} (full lifespan, not windowed)")
+    print("  PASSED")
+
+
+def test_max_tau_per_step_truncation():
+    """max_tau_per_step limits patches per STEP token, keeping highest IoU.
+
+    Uses a large mask that spans many grid cells, then verifies that the
+    serialized tau list is capped to max_tau_per_step entries and that
+    retained entries are the ones with highest IoU.
+    """
+    print("\n=== Test: max_tau_per_step truncation ===")
+
+    config = FastSNOWConfig()
+    config.step.max_tau_per_step = 3  # Very small for testing
+    pipeline = FastSNOWPipeline(config)
+
+    H, W = 480, 640
+    K = make_identity_intrinsics()
+    T_wc = np.eye(4, dtype=np.float64)
+    depth = make_depth_map(H, W, base_depth=5.0)
+
+    # Large mask covering ~40% of the image → many grid cells with IoU > 0.5
+    mask = make_mask(H, W, y0=50, y1=400, x0=100, x1=500)
+
+    frame = FastFrameInput(
+        frame_idx=0,
+        depth_t=depth,
+        K_t=K,
+        T_wc_t=T_wc,
+        detections=[
+            FastLocalDetection(run_id=0, local_obj_id=0, mask=mask, score=0.9),
+        ],
+    )
+    pipeline.process_frame(frame)
+
+    # First: check unlimited to know we'd have more than 3
+    config_unlimited = FastSNOWConfig()
+    config_unlimited.step.max_tau_per_step = 0  # unlimited
+    pipeline_unlimited = FastSNOWPipeline(config_unlimited)
+    pipeline_unlimited.process_frame(frame)
+    result_unlimited = pipeline_unlimited.build_4dsg_dict()
+    tau_unlimited = result_unlimited["tracks"][0]["F_k"][0]["tau"]
+    assert len(tau_unlimited) > 3, (
+        f"Need >3 patches for test to be meaningful, got {len(tau_unlimited)}"
+    )
+
+    # Now check limited
+    result = pipeline.build_4dsg_dict()
+    tau = result["tracks"][0]["F_k"][0]["tau"]
+    assert len(tau) == 3, (
+        f"Expected exactly 3 patches (max_tau_per_step=3), got {len(tau)}"
+    )
+
+    # Verify these are the top-3 by IoU from the unlimited set
+    unlimited_sorted = sorted(tau_unlimited, key=lambda p: p["iou"], reverse=True)
+    top3_ious = {round(p["iou"], 6) for p in unlimited_sorted[:3]}
+    actual_ious = {round(p["iou"], 6) for p in tau}
+    assert actual_ious == top3_ious, (
+        f"Retained patches should have top-3 IoUs {top3_ious}, got {actual_ious}"
+    )
+
+    print(f"  Large mask → {len(tau_unlimited)} patches unlimited, {len(tau)} with max_tau=3")
+    print(f"  Retained IoUs: {sorted(actual_ious, reverse=True)}")
+    print("  PASSED (top-k by IoU)")
+
+
 if __name__ == "__main__":
     print("Fast-SNOW Smoke Test (no GPU)\n")
 
@@ -1056,11 +1055,12 @@ if __name__ == "__main__":
     test_conf_thresh_filtering()
     test_max_extent_filtering()
     test_archived_track_not_reactivated()
-    test_motion_cold_start_and_rate()
     test_merge_deduplicates_observations()
     test_merge_keeps_winner_observation()
     test_visual_anchor_metadata()
     test_result_cleanup()
+    test_temporal_window_trims_fk()
+    test_max_tau_per_step_truncation()
 
     print("\n" + "=" * 50)
     print("ALL SMOKE TESTS PASSED")

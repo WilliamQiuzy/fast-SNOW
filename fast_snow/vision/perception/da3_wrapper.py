@@ -1,7 +1,20 @@
 """DA3 (Depth Anything V3) wrapper for Fast-SNOW pipeline.
 
-Implements Step 2: per-frame monocular depth estimation.
-Output: depth map, intrinsics K, extrinsics T_wc, depth confidence.
+Implements Step 2: monocular depth + pose estimation.
+
+Single-frame mode (``infer``):  depth only -- T_wc ~ identity (no
+inter-frame motion).
+
+Batch mode (``infer_batch``):  all frames processed together so DA3
+can estimate inter-frame camera poses.  Frame 0 is normalised to
+identity; subsequent T_wc encode motion relative to frame 0.  This is
+the recommended mode for building a 4DSG with consistent world
+coordinates.
+
+Chunked batch mode (``infer_batch_chunked``):  when frames exceed
+``chunk_size``, splits into overlapping chunks and aligns them via
+SIM3 point-cloud matching on overlap frames.  Produces output
+identical in format to ``infer_batch``.
 """
 
 from __future__ import annotations
@@ -9,7 +22,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -23,15 +36,18 @@ class DA3Result:
     """Output of DA3 inference for a single frame.
 
     Attributes:
-        depth: (H, W) metric depth map in meters.
+        depth: (H, W) depth map.  Metric (metres) when the model is a nested
+            metric variant; relative (arbitrary scale) otherwise.
         K: (3, 3) camera intrinsics matrix.
         T_wc: (4, 4) world-to-camera transform (p_cam = T_wc @ p_world).
         depth_conf: (H, W) per-pixel depth confidence in [0, 1].
+        is_metric: Whether depth values are in absolute metres.
     """
     depth: np.ndarray
     K: np.ndarray
     T_wc: np.ndarray
     depth_conf: np.ndarray
+    is_metric: bool = True
 
     @property
     def T_cw(self) -> np.ndarray:
@@ -62,6 +78,17 @@ class DA3Wrapper:
         self._model = self._model.to(self.config.device)
         self._model.eval()
         logger.info("DA3 model loaded from %s on %s", self.config.model_path, self.config.device)
+
+    def unload(self) -> None:
+        """Release the DA3 model from GPU memory."""
+        if self._model is None:
+            return
+        import torch
+        del self._model
+        self._model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("DA3 model unloaded from GPU")
 
     def infer(self, image: Union[np.ndarray, str, Path]) -> DA3Result:
         """Run DA3 on a single image.
@@ -109,12 +136,15 @@ class DA3Wrapper:
                 "DA3 did not output extrinsics (T_wc). "
                 "Ensure model_path points to a model that supports pose estimation."
             )
-        if not prediction.is_metric:
+        is_metric = bool(prediction.is_metric)
+        if self.config.require_metric and not is_metric:
             raise RuntimeError(
                 f"DA3 model at {self.config.model_path} outputs relative depth "
-                f"(is_metric=0). Step 2 requires metric depth in metres. "
-                f"Use a metric model (e.g. da3nested-giant-large)."
+                f"(is_metric=0) but require_metric=True. "
+                f"Use a metric model (e.g. da3nested-giant-large) or set require_metric=False."
             )
+        if not is_metric:
+            logger.info("DA3 outputs relative depth (not metric). 3D scale is arbitrary.")
 
         # Extract single-frame results (batch dim = 0)
         depth = prediction.depth[0]  # (proc_H, proc_W)
@@ -139,8 +169,8 @@ class DA3Wrapper:
         #
         # DA3 forward pipeline:
         #   orig (orig_w, orig_h)
-        #     → boundary resize → (resized_w, resized_h)    [K scaled]
-        #     → (*crop only) center-crop to PATCH_SIZE multiples → (proc_w, proc_h)  [K cx/cy shifted]
+        #     -> boundary resize -> (resized_w, resized_h)    [K scaled]
+        #     -> (*crop only) center-crop to PATCH_SIZE multiples -> (proc_w, proc_h)  [K cx/cy shifted]
         #
         # We invert in reverse order: undo crop, then undo resize.
         proc_h, proc_w = depth.shape
@@ -178,7 +208,7 @@ class DA3Wrapper:
                 )
 
                 # 3) Undo boundary resize: scale K and depth/conf
-                #    from (resized_h, resized_w) → (orig_h, orig_w)
+                #    from (resized_h, resized_w) -> (orig_h, orig_w)
                 sx, sy = orig_w / resized_w, orig_h / resized_h
                 K[0, :] *= sx
                 K[1, :] *= sy
@@ -198,4 +228,596 @@ class DA3Wrapper:
             K=K.astype(np.float64),
             T_wc=T_wc.astype(np.float64),
             depth_conf=conf,
+            is_metric=is_metric,
         )
+
+    # ------------------------------------------------------------------
+    # Batch inference (consistent inter-frame poses)
+    # ------------------------------------------------------------------
+
+    def infer_batch(self, images: Sequence[Union[np.ndarray, str, Path]]) -> List[DA3Result]:
+        """Run DA3 on multiple frames with consistent inter-frame poses.
+
+        When ``config.chunk_size > 0`` and ``len(images) > chunk_size``,
+        automatically routes to chunked inference with SIM3 alignment.
+        Otherwise runs all frames in a single forward pass.
+
+        Frame 0 is normalised to T_wc = identity; subsequent T_wc encode
+        motion relative to frame 0.
+
+        Args:
+            images: List of RGB images (H, W, 3) uint8 ndarrays or paths.
+
+        Returns:
+            List of DA3Result, one per frame, with consistent depth, K,
+            T_wc across all frames.
+        """
+        if len(images) == 0:
+            return []
+        if len(images) == 1:
+            return [self.infer(images[0])]
+
+        cs = self.config.chunk_size
+        if cs > 0 and len(images) > cs:
+            return self.infer_batch_chunked(images)
+
+        return self._infer_batch_core(images)
+
+    def _infer_batch_core(
+        self, images: Sequence[Union[np.ndarray, str, Path]],
+    ) -> List[DA3Result]:
+        """Run DA3 on multiple frames in a single forward pass (original path).
+
+        This is the internal implementation that always sends all frames to
+        DA3 in one batch.  For the public API with auto-chunking, use
+        ``infer_batch``.
+        """
+        self.load()
+
+        import torch
+        from PIL import Image as PILImage
+
+        # Convert all images to PIL and record per-frame original resolution
+        pil_images: List = []
+        orig_sizes: List[Tuple[int, int]] = []  # (orig_h, orig_w) per frame
+        for img in images:
+            if isinstance(img, (str, Path)):
+                pil = PILImage.open(str(img)).convert("RGB")
+            elif isinstance(img, np.ndarray):
+                pil = PILImage.fromarray(img)
+            else:
+                pil = img
+            orig_sizes.append((pil.height, pil.width))
+            pil_images.append(pil)
+
+        with torch.inference_mode():
+            prediction = self._model.inference(
+                image=pil_images,
+                process_res=self.config.process_res,
+                process_res_method=self.config.process_res_method,
+            )
+
+        # Validate
+        if prediction.intrinsics is None:
+            raise RuntimeError("DA3 did not output intrinsics (K).")
+        if prediction.extrinsics is None:
+            raise RuntimeError("DA3 did not output extrinsics (T_wc).")
+        is_metric = bool(prediction.is_metric)
+        if self.config.require_metric and not is_metric:
+            raise RuntimeError(
+                f"DA3 model outputs relative depth but require_metric=True."
+            )
+
+        n_frames = len(pil_images)
+
+        # Extract and guarantee (4, 4) for all extrinsics first
+        all_T_wc: List[np.ndarray] = []
+        for i in range(n_frames):
+            T_wc = prediction.extrinsics[i]
+            if T_wc.ndim == 2 and T_wc.shape == (3, 4):
+                T_wc_44 = np.eye(4, dtype=T_wc.dtype)
+                T_wc_44[:3, :] = T_wc
+                T_wc = T_wc_44
+            elif T_wc.shape != (4, 4):
+                raise RuntimeError(
+                    f"DA3 extrinsics[{i}] has unexpected shape {T_wc.shape}."
+                )
+            all_T_wc.append(T_wc.astype(np.float64))
+
+        # Normalize: make frame 0 exactly identity (world = camera-0 frame).
+        # T_wc_new[i] = T_wc_raw[i] @ inv(T_wc_raw[0])
+        T0_inv = np.linalg.inv(all_T_wc[0])
+        for i in range(n_frames):
+            all_T_wc[i] = all_T_wc[i] @ T0_inv
+
+        results: List[DA3Result] = []
+
+        for i in range(n_frames):
+            depth = prediction.depth[i]
+            K = prediction.intrinsics[i]
+            T_wc = all_T_wc[i]
+
+            conf = (
+                prediction.conf[i].astype(np.float32)
+                if prediction.conf is not None
+                else np.ones_like(depth, dtype=np.float32)
+            )
+
+            # Resize depth/conf to this frame's original resolution
+            orig_h, orig_w = orig_sizes[i]
+            proc_h, proc_w = depth.shape
+            if proc_h != orig_h or proc_w != orig_w:
+                depth, conf, K = self._resize_to_original(
+                    depth, conf, K, orig_h, orig_w, proc_h, proc_w,
+                )
+
+            results.append(DA3Result(
+                depth=depth.astype(np.float32),
+                K=K.astype(np.float64),
+                T_wc=T_wc.astype(np.float64),
+                depth_conf=conf,
+                is_metric=is_metric,
+            ))
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Chunked batch inference (SIM3-aligned overlapping chunks)
+    # ------------------------------------------------------------------
+
+    def infer_batch_chunked(
+        self, images: Sequence[Union[np.ndarray, str, Path]],
+    ) -> List[DA3Result]:
+        """Run DA3 in overlapping chunks with SIM3 pose alignment.
+
+        Splits frames into overlapping chunks, runs DA3 batch inference
+        on each chunk independently, then aligns all chunks to chunk 0's
+        coordinate system via SIM3 point-cloud matching on overlap frames.
+
+        The output format is identical to ``infer_batch``: frame 0 is
+        normalised to T_wc = identity.
+
+        Args:
+            images: Sequence of RGB images or paths.
+
+        Returns:
+            List of DA3Result, one per frame, with chunk-aligned poses.
+        """
+        import torch
+
+        images_list = list(images)
+        n = len(images_list)
+        chunk_size = self.config.chunk_size
+        overlap = self.config.chunk_overlap
+
+        if overlap < 2:
+            raise ValueError(
+                f"chunk_overlap must be >= 2 for SIM3 alignment, got {overlap}"
+            )
+        if overlap >= chunk_size:
+            raise ValueError(
+                f"chunk_overlap ({overlap}) must be < chunk_size ({chunk_size})"
+            )
+
+        chunks = compute_chunks(n, chunk_size, overlap)
+
+        if len(chunks) == 1:
+            return self._infer_batch_core(images_list)
+
+        logger.info(
+            "Chunked DA3: %d frames -> %d chunks (size=%d, overlap=%d)",
+            n, len(chunks), chunk_size, overlap,
+        )
+
+        step = chunk_size - overlap
+
+        # ------ Phase 1: run DA3 on each chunk ------
+        chunk_results: List[List[DA3Result]] = []
+        for ci, (start, end) in enumerate(chunks):
+            logger.info(
+                "  Chunk %d/%d: frames [%d, %d) (%d frames)",
+                ci + 1, len(chunks), start, end, end - start,
+            )
+            results = self._infer_batch_core(images_list[start:end])
+            chunk_results.append(results)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # ------ Phase 2: pairwise SIM3 between adjacent chunks ------
+        pairwise_sim3: List[Tuple[float, np.ndarray, np.ndarray]] = []
+        for ci in range(len(chunks) - 1):
+            prev_start, prev_end = chunks[ci]
+            curr_start, curr_end = chunks[ci + 1]
+            actual_overlap = prev_end - curr_start
+
+            s, R, t = _align_overlap(
+                chunk_results[ci][-actual_overlap:],
+                chunk_results[ci + 1][:actual_overlap],
+            )
+            pairwise_sim3.append((s, R, t))
+            logger.info(
+                "  SIM3 chunk %d->%d: s=%.4f", ci + 1, ci, s,
+            )
+
+        # ------ Phase 3: accumulate to chunk 0 frame ------
+        cumulative = _accumulate_sim3(pairwise_sim3)
+
+        # ------ Phase 4: assign frames and apply SIM3 ------
+        final: List[Optional[DA3Result]] = [None] * n
+        for ci, (start, end) in enumerate(chunks):
+            s_cum, R_cum, t_cum = cumulative[ci]
+            chunk_len = end - start
+
+            # Each chunk contributes its first `step` local frames,
+            # except the last chunk which contributes all its frames.
+            use_count = step if ci < len(chunks) - 1 else chunk_len
+
+            for local_i in range(use_count):
+                global_i = start + local_i
+                if global_i >= n:
+                    break
+                result = chunk_results[ci][local_i]
+                if ci > 0:
+                    result = _apply_sim3_to_result(result, s_cum, R_cum, t_cum)
+                final[global_i] = result
+
+        # Verify completeness
+        for i, r in enumerate(final):
+            if r is None:
+                raise RuntimeError(
+                    f"Frame {i} was not assigned to any chunk "
+                    f"(chunks={chunks}, step={step})"
+                )
+
+        # ------ Phase 5: normalise frame 0 to identity ------
+        # Chunk 0 already normalised frame 0 to identity in _infer_batch_core,
+        # and we did not apply SIM3 to chunk 0, so this should be a no-op.
+        # We do it explicitly for safety.
+        T0_inv = np.linalg.inv(final[0].T_wc)
+        if not np.allclose(T0_inv, np.eye(4), atol=1e-6):
+            for i in range(n):
+                r = final[i]
+                final[i] = DA3Result(
+                    depth=r.depth,
+                    K=r.K,
+                    T_wc=(r.T_wc @ T0_inv).astype(np.float64),
+                    depth_conf=r.depth_conf,
+                    is_metric=r.is_metric,
+                )
+
+        return final  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _resize_to_original(
+        self,
+        depth: np.ndarray,
+        conf: np.ndarray,
+        K: np.ndarray,
+        orig_h: int,
+        orig_w: int,
+        proc_h: int,
+        proc_w: int,
+    ):
+        """Resize depth/conf from DA3 processing resolution to original and adjust K."""
+        import cv2
+
+        method = self.config.process_res_method
+        K = K.copy()
+
+        if "crop" in method:
+            process_res = self.config.process_res
+            if method.startswith("upper_bound"):
+                scale = process_res / max(orig_w, orig_h)
+            else:
+                scale = process_res / min(orig_w, orig_h)
+            resized_w = max(1, round(orig_w * scale))
+            resized_h = max(1, round(orig_h * scale))
+
+            crop_x = (resized_w - proc_w) // 2
+            crop_y = (resized_h - proc_h) // 2
+            K[0, 2] += crop_x
+            K[1, 2] += crop_y
+
+            pad_bottom = resized_h - proc_h - crop_y
+            pad_right = resized_w - proc_w - crop_x
+            depth = cv2.copyMakeBorder(
+                depth, crop_y, pad_bottom, crop_x, pad_right,
+                cv2.BORDER_REPLICATE,
+            )
+            conf = cv2.copyMakeBorder(
+                conf, crop_y, pad_bottom, crop_x, pad_right,
+                cv2.BORDER_CONSTANT, value=0,
+            )
+
+            sx, sy = orig_w / resized_w, orig_h / resized_h
+            K[0, :] *= sx
+            K[1, :] *= sy
+            depth = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            conf = cv2.resize(conf, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            depth = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            conf = cv2.resize(conf, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            sx, sy = orig_w / proc_w, orig_h / proc_h
+            K[0, :] *= sx
+            K[1, :] *= sy
+
+        return depth, conf, K
+
+
+# ======================================================================
+# Module-level helpers (pure functions, importable for testing)
+# ======================================================================
+
+def compute_chunks(
+    n: int, chunk_size: int, overlap: int,
+) -> List[Tuple[int, int]]:
+    """Compute (start, end) chunk boundaries for *n* frames.
+
+    Adjacent chunks overlap by *overlap* frames.  If the last chunk would
+    have fewer than *overlap* frames it is merged into the previous one.
+    """
+    step = chunk_size - overlap
+    chunks: List[Tuple[int, int]] = []
+    start = 0
+    while start < n:
+        end = min(start + chunk_size, n)
+        chunks.append((start, end))
+        if end >= n:
+            break
+        start += step
+
+    # Merge a tiny trailing chunk into the previous one.
+    if len(chunks) >= 2:
+        last_len = chunks[-1][1] - chunks[-1][0]
+        if last_len <= overlap:
+            merged_end = chunks[-1][1]
+            chunks.pop()
+            chunks[-1] = (chunks[-1][0], merged_end)
+
+    return chunks
+
+
+def backproject_depth(
+    depth: np.ndarray,
+    K: np.ndarray,
+    T_wc: np.ndarray,
+) -> np.ndarray:
+    """Backproject a depth map to 3D world coordinates.
+
+    Args:
+        depth: (H, W) depth map (float).
+        K: (3, 3) camera intrinsics.
+        T_wc: (4, 4) world-to-camera transform.
+
+    Returns:
+        (H, W, 3) world-coordinate point cloud.
+    """
+    H, W = depth.shape
+    K_inv = np.linalg.inv(K[:3, :3].astype(np.float64))
+    T_cw = np.linalg.inv(T_wc.astype(np.float64))
+    R_cw = T_cw[:3, :3]
+    t_cw = T_cw[:3, 3]
+
+    u = np.arange(W, dtype=np.float64)
+    v = np.arange(H, dtype=np.float64)
+    uu, vv = np.meshgrid(u, v)
+    pixels = np.stack([uu, vv, np.ones_like(uu)], axis=-1)  # (H, W, 3)
+
+    rays = (K_inv @ pixels.reshape(-1, 3).T).T.reshape(H, W, 3)
+    points_cam = rays * depth[..., None].astype(np.float64)
+    points_world = (R_cw @ points_cam.reshape(-1, 3).T).T + t_cw
+    return points_world.reshape(H, W, 3).astype(np.float64)
+
+
+def estimate_sim3(
+    source: np.ndarray,
+    target: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """Estimate SIM3 via Umeyama: target ~ s * R @ source + t.
+
+    Args:
+        source: (N, 3) points to be transformed.
+        target: (N, 3) reference points.
+        weights: (N,) optional per-point weights >= 0.
+
+    Returns:
+        (s, R, t) where s is scale, R is (3,3) rotation, t is (3,) translation.
+    """
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    n = len(source)
+    if n < 3:
+        return 1.0, np.eye(3), np.zeros(3)
+
+    if weights is None:
+        w = np.ones(n, dtype=np.float64)
+    else:
+        w = np.asarray(weights, dtype=np.float64)
+
+    w_sum = w.sum()
+    if w_sum < 1e-12:
+        return 1.0, np.eye(3), np.zeros(3)
+
+    mu_s = (w[:, None] * source).sum(axis=0) / w_sum
+    mu_t = (w[:, None] * target).sum(axis=0) / w_sum
+
+    src_c = source - mu_s
+    tgt_c = target - mu_t
+
+    # Weighted covariance
+    Sigma = (tgt_c * w[:, None]).T @ src_c / w_sum
+    U, D, Vt = np.linalg.svd(Sigma)
+
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1
+
+    R = U @ S @ Vt
+
+    var_src = (w[:, None] * src_c ** 2).sum() / w_sum
+    s = float(np.trace(np.diag(D) @ S) / var_src) if var_src > 1e-12 else 1.0
+
+    t = mu_t - s * R @ mu_s
+    return s, R, t
+
+
+def estimate_sim3_robust(
+    source: np.ndarray,
+    target: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+    delta: float = 0.5,
+    max_iters: int = 5,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """Robust SIM3 via IRLS with Huber loss.
+
+    First runs Umeyama, then iteratively reweights outliers.
+    """
+    s, R, t = estimate_sim3(source, target, weights)
+
+    for _ in range(max_iters):
+        transformed = s * (R @ source.T).T + t
+        residuals = np.linalg.norm(transformed - target, axis=1)
+
+        huber_w = np.where(residuals < delta, 1.0, delta / (residuals + 1e-12))
+        combined = huber_w if weights is None else weights * huber_w
+
+        s_new, R_new, t_new = estimate_sim3(source, target, combined)
+        if abs(s_new - s) < 1e-8 and np.allclose(R_new, R, atol=1e-8):
+            break
+        s, R, t = s_new, R_new, t_new
+
+    return s, R, t
+
+
+def _accumulate_sim3(
+    pairwise: List[Tuple[float, np.ndarray, np.ndarray]],
+) -> List[Tuple[float, np.ndarray, np.ndarray]]:
+    """Convert pairwise SIM3 [chunk1->0, chunk2->1, ...] to cumulative.
+
+    cumulative[0] = identity (chunk 0 is the reference).
+    cumulative[j] maps chunk j's world -> chunk 0's world.
+    """
+    cumulative: List[Tuple[float, np.ndarray, np.ndarray]] = [
+        (1.0, np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64)),
+    ]
+    for s, R, t in pairwise:
+        s_prev, R_prev, t_prev = cumulative[-1]
+        s_cum = s_prev * s
+        R_cum = R_prev @ R
+        t_cum = s_prev * (R_prev @ t) + t_prev
+        cumulative.append((s_cum, R_cum, t_cum))
+    return cumulative
+
+
+def _apply_sim3_to_result(
+    result: DA3Result,
+    s: float,
+    R: np.ndarray,
+    t: np.ndarray,
+) -> DA3Result:
+    """Apply cumulative SIM3 to a DA3Result.
+
+    Transforms the result from a source chunk's coordinate system into the
+    target (chunk 0) coordinate system.
+
+    SIM3 semantics:  p_target = s * R @ p_source + t
+
+    We scale depth by *s* so that backprojection with the new T_wc yields
+    correct world-coordinate points:
+        p_cam  = K^{-1} * [u,v,1] * (s * depth)
+        p_world = R_cw_new @ p_cam + t_cw_new
+                = s * R_sim3 @ (R_cw @ K^{-1}*[u,v,1]*depth + t_cw) + t_sim3
+    """
+    T_cw = np.linalg.inv(result.T_wc.astype(np.float64))
+    R_cw = T_cw[:3, :3]
+    t_cw = T_cw[:3, 3]
+
+    R_cw_new = R @ R_cw
+    t_cw_new = s * (R @ t_cw) + t
+
+    T_cw_new = np.eye(4, dtype=np.float64)
+    T_cw_new[:3, :3] = R_cw_new
+    T_cw_new[:3, 3] = t_cw_new
+    T_wc_new = np.linalg.inv(T_cw_new)
+
+    return DA3Result(
+        depth=(result.depth * float(s)).astype(np.float32),
+        K=result.K.copy(),
+        T_wc=T_wc_new.astype(np.float64),
+        depth_conf=result.depth_conf.copy(),
+        is_metric=result.is_metric,
+    )
+
+
+def _align_overlap(
+    prev_overlap: List[DA3Result],
+    curr_overlap: List[DA3Result],
+    conf_threshold: float = 0.2,
+    depth_max: float = 100.0,
+    max_points: int = 100_000,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """Compute SIM3 from curr chunk's world -> prev chunk's world.
+
+    Uses the overlap frames (same physical frames in both chunks) to
+    build corresponding 3D point clouds and run robust SIM3 estimation.
+    """
+    all_prev_pts: List[np.ndarray] = []
+    all_curr_pts: List[np.ndarray] = []
+    all_weights: List[np.ndarray] = []
+
+    for prev_r, curr_r in zip(prev_overlap, curr_overlap):
+        pp = backproject_depth(prev_r.depth, prev_r.K, prev_r.T_wc)
+        cp = backproject_depth(curr_r.depth, curr_r.K, curr_r.T_wc)
+        w = np.minimum(prev_r.depth_conf, curr_r.depth_conf).astype(np.float64)
+
+        all_prev_pts.append(pp.reshape(-1, 3))
+        all_curr_pts.append(cp.reshape(-1, 3))
+        all_weights.append(w.reshape(-1))
+
+    prev_pts = np.concatenate(all_prev_pts)
+    curr_pts = np.concatenate(all_curr_pts)
+    weights = np.concatenate(all_weights)
+
+    # Filter: confidence, finite values, depth range
+    valid = (
+        (weights > conf_threshold)
+        & np.isfinite(prev_pts).all(axis=1)
+        & np.isfinite(curr_pts).all(axis=1)
+        & (np.linalg.norm(prev_pts, axis=1) < depth_max)
+        & (np.linalg.norm(curr_pts, axis=1) < depth_max)
+    )
+    prev_pts = prev_pts[valid]
+    curr_pts = curr_pts[valid]
+    weights = weights[valid]
+
+    if len(prev_pts) < 10:
+        logger.warning(
+            "Only %d valid point pairs for SIM3 alignment -- falling back "
+            "to identity (no scale/rotation/translation correction)",
+            len(prev_pts),
+        )
+        return 1.0, np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
+
+    # Subsample for speed
+    rng = np.random.default_rng(42)
+    if len(prev_pts) > max_points:
+        idx = rng.choice(len(prev_pts), max_points, replace=False)
+        prev_pts = prev_pts[idx]
+        curr_pts = curr_pts[idx]
+        weights = weights[idx]
+
+    # SIM3: curr_world -> prev_world
+    s, R, t = estimate_sim3_robust(curr_pts, prev_pts, weights)
+
+    # Sanity: reject degenerate transforms
+    if s < 0.01 or s > 100.0:
+        logger.warning(
+            "SIM3 scale %.4f is suspicious -- clamping to identity", s,
+        )
+        return 1.0, np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
+
+    return s, R, t

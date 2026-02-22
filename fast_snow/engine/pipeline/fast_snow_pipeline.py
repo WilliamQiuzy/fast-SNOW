@@ -4,7 +4,7 @@ Implements the Fast-SNOW route in docs/roadmap/Fast-SNOW_IMPLEMENTATION.md:
 - Step 4: mask + depth backprojection and geometric filtering
 - Step 5: cross-run global ID fusion
 - Step 6: STEP token construction
-- Step 7: per-frame relation graph + temporal tracks
+- Step 7: temporal tracks (F_k)
 - Step 8: strict 1:1 JSON serialization
 
 This module is model-agnostic: callers provide per-frame SAM3 detections and DA3 outputs.
@@ -13,7 +13,6 @@ This module is model-agnostic: callers provide per-frame SAM3 detections and DA3
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass, field
 from typing import Dict, Hashable, Iterable, List, Optional, Sequence, Tuple
 
@@ -51,6 +50,9 @@ class FastFrameInput:
         detections: SAM3 detections from all active runs for this frame.
         depth_conf_t: DA3 depth confidence map (H, W), values in [0, 1].
             When None, all pixels are trusted (equivalent to ones_like(depth_t)).
+        depth_is_metric: Whether depth_t is in absolute metres (True) or
+            relative/arbitrary scale (False).  When False, max_extent
+            filtering is skipped since the threshold is meaningless.
     """
 
     frame_idx: int
@@ -59,6 +61,8 @@ class FastFrameInput:
     T_wc_t: np.ndarray
     detections: Sequence[FastLocalDetection]
     depth_conf_t: Optional[np.ndarray] = None
+    depth_is_metric: bool = True
+    timestamp_s: float = 0.0  # Physical timestamp in seconds from video start
 
 
 @dataclass(frozen=True)
@@ -75,8 +79,6 @@ class _TrackState:
     missing_streak: int = 0
     last_seen_t: Optional[int] = None
     last_centroid: Optional[np.ndarray] = None
-    # (frame_idx, ego-distance, ego-lateral)
-    motion_samples: List[Tuple[int, float, float]] = field(default_factory=list)
 
     def observe(self, frame_idx: int, step: STEPToken, centroid: np.ndarray) -> None:
         if self.status == "archived":
@@ -122,7 +124,6 @@ class FastSNOWPipeline:
         self._local_to_global: Dict[RunKey, int] = {}
         self._tracks: Dict[int, _TrackState] = {}
         self._ego_poses_cw: Dict[int, np.ndarray] = {}
-        self._frame_relations: Dict[int, Tuple[List[Dict[str, object]], List[Dict[str, object]]]] = {}
         self._latest_frame_idx: Optional[int] = None
 
     def process_frames(self, frames: Iterable[FastFrameInput], reset: bool = True) -> None:
@@ -143,20 +144,15 @@ class FastSNOWPipeline:
         winners = self._fuse_candidates(frame.frame_idx, candidates)
 
         touched: set[int] = set()
-        visible: Dict[int, _Candidate] = {}
 
         for gid, cand in winners.items():
             state = self._tracks.setdefault(gid, _TrackState(track_id=gid))
             state.observe(frame.frame_idx, cand.step, cand.centroid_xyz)
             touched.add(gid)
-            visible[gid] = cand
 
         for gid, state in self._tracks.items():
             if gid not in touched:
                 state.miss(self.config)
-
-        ego_rel, obj_rel = self._compute_relations(frame.frame_idx, T_cw_t, visible)
-        self._frame_relations[frame.frame_idx] = (ego_rel, obj_rel)
 
     def build_4dsg_dict(
         self,
@@ -188,6 +184,13 @@ class FastSNOWPipeline:
             obs_sorted = sorted(state.observations, key=lambda x: x.frame_idx)
             t_start = obs_sorted[0].frame_idx
             t_end = obs_sorted[-1].frame_idx
+
+            # Sliding window: keep only the most recent T observations
+            # for VLM serialization (SNOW §4.2, Eq. 7).
+            T = self.config.step.temporal_window
+            if T > 0 and len(obs_sorted) > T:
+                obs_sorted = obs_sorted[-T:]
+
             fk: List[Dict[str, object]] = []
 
             for obs in obs_sorted:
@@ -196,16 +199,19 @@ class FastSNOWPipeline:
 
             tracks_entries.append({"object_id": gid, "F_k": fk})
 
-        latest = self._latest_frame_idx
-        if latest is not None and latest in self._frame_relations:
-            ego_rel, obj_rel = self._frame_relations[latest]
-        else:
-            ego_rel, obj_rel = [], []
-
         metadata: Dict[str, object] = {
             "grid": f"{grid}x{grid}",
             "num_frames": len(self._ego_poses_cw),
             "num_tracks": len(tracks_entries),
+            "coordinate_system": "World frame = first frame camera. X=right, Y=down, Z=forward. Scale: metres if metric model, otherwise relative.",
+            "schema": {
+                "ego[].xyz": "Camera position in world coordinates [x, y, z].",
+                "tracks[].F_k[]": "Per-frame STEP token S_t^k (Eq. 4). Fields use paper symbols.",
+                "tau": f"Image patch tokens: occupied cells in a {grid}x{grid} grid on the masked image. row/col = grid index; iou = mask-cell overlap.",
+                "c": "Centroid token: 3D center of the object's point cloud in world coordinates [x, y, z].",
+                "s": "Shape token: per-axis Gaussian statistics (mu, sigma, min, max) of the object's 3D point cloud.",
+                "theta": "Temporal token: [t_start, t_end] track-level lifespan.",
+            },
         }
         if visual_anchor is not None:
             metadata["visual_anchor"] = visual_anchor
@@ -214,8 +220,6 @@ class FastSNOWPipeline:
             "metadata": metadata,
             "ego": ego_entries,
             "tracks": tracks_entries,
-            "ego_relations": ego_rel,
-            "object_relations": obj_rel,
         }
 
     def serialize_4dsg(
@@ -246,16 +250,19 @@ class FastSNOWPipeline:
                 continue
 
             shape = build_shape_token(points_world)
-            extents = np.array(
-                [
-                    shape.x_max - shape.x_min,
-                    shape.y_max - shape.y_min,
-                    shape.z_max - shape.z_min,
-                ],
-                dtype=float,
-            )
-            if np.any(extents > self.config.depth_filter.max_extent):
-                continue
+            # max_extent filter only meaningful with metric depth;
+            # relative depth has arbitrary scale → skip to avoid false rejection.
+            if frame.depth_is_metric:
+                extents = np.array(
+                    [
+                        shape.x_max - shape.x_min,
+                        shape.y_max - shape.y_min,
+                        shape.z_max - shape.z_min,
+                    ],
+                    dtype=float,
+                )
+                if np.any(extents > self.config.depth_filter.max_extent):
+                    continue
 
             centroid = build_centroid_token(points_world)
             patch_tokens = mask_to_patch_tokens(
@@ -409,15 +416,6 @@ class FastSNOWPipeline:
             obs_by_frame[obs.frame_idx] = obs  # keep overwrites drop
         keep.observations = sorted(obs_by_frame.values(), key=lambda x: x.frame_idx)
 
-        # Merge and deduplicate motion_samples: one per frame_idx.
-        # Prefer keep's samples (derived from winner candidate).
-        ms_by_frame: Dict[int, Tuple[int, float, float]] = {}
-        for s in drop.motion_samples:
-            ms_by_frame[s[0]] = s
-        for s in keep.motion_samples:
-            ms_by_frame[s[0]] = s  # keep overwrites drop
-        keep.motion_samples = sorted(ms_by_frame.values(), key=lambda x: x[0])
-
         if keep.last_seen_t is None or (drop.last_seen_t is not None and drop.last_seen_t > keep.last_seen_t):
             keep.last_seen_t = drop.last_seen_t
             keep.last_centroid = drop.last_centroid
@@ -428,118 +426,29 @@ class FastSNOWPipeline:
 
         del self._tracks[drop_gid]
 
-    def _compute_relations(
+    def _step_to_json(
         self,
         frame_idx: int,
-        T_cw_t: np.ndarray,
-        visible: Dict[int, _Candidate],
-    ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-        if not visible:
-            return [], []
+        step: STEPToken,
+    ) -> Dict[str, object]:
+        # Top-k patch selection: sort by IoU desc, keep at most max_tau_per_step.
+        patches = list(step.patch_tokens)
+        k = self.config.step.max_tau_per_step
+        if k > 0 and len(patches) > k:
+            patches.sort(key=lambda p: p.iou, reverse=True)
+            patches = patches[:k]
 
-        ego_xyz = T_cw_t[:3, 3]
-        R_cw = T_cw_t[:3, :3]
-        forward_world = R_cw @ np.array([0.0, 0.0, 1.0], dtype=float)
-        yaw = float(np.arctan2(forward_world[1], forward_world[0]))
-        c, s = math.cos(yaw), math.sin(yaw)
-        R_ego = np.array([[c, -s], [s, c]], dtype=float)
+        tau_list: List[Dict[str, object]] = []
+        for p in patches:
+            tau_list.append({
+                "row": int(p.row),
+                "col": int(p.col),
+                "iou": float(p.iou),
+            })
 
-        ego_relations: List[Dict[str, object]] = []
-        for gid in sorted(visible.keys()):
-            cand = visible[gid]
-            delta = cand.centroid_xyz - ego_xyz
-            d_xy_ego = R_ego.T @ delta[:2]
-            angle = float(np.arctan2(d_xy_ego[1], d_xy_ego[0]))
-            bearing = self._quantize_8_way(angle)
-            elev = self._elev_relation(float(delta[2]))
-            dist_m = float(np.linalg.norm(delta))
-
-            track = self._tracks[gid]
-            track.motion_samples.append((frame_idx, dist_m, float(d_xy_ego[1])))
-            # Cap to motion_window to prevent unbounded growth
-            window = max(2, self.config.edge.motion_window)
-            if len(track.motion_samples) > window:
-                track.motion_samples = track.motion_samples[-window:]
-            motion = self._infer_motion(track)
-
-            ego_relations.append(
-                {
-                    "object_id": gid,
-                    "bearing": bearing,
-                    "elev": elev,
-                    "dist_m": dist_m,
-                    "motion": motion,
-                }
-            )
-
-        object_relations: List[Dict[str, object]] = []
-        ids = sorted(visible.keys())
-        k = max(1, self.config.edge.knn_k)
-
-        for src in ids:
-            src_c = visible[src].centroid_xyz
-            neighbors: List[Tuple[float, int]] = []
-            for dst in ids:
-                if src == dst:
-                    continue
-                dst_c = visible[dst].centroid_xyz
-                dist = float(np.linalg.norm(dst_c - src_c))
-                neighbors.append((dist, dst))
-
-            neighbors.sort(key=lambda x: x[0])
-            for dist, dst in neighbors[:k]:
-                dst_c = visible[dst].centroid_xyz
-                delta = dst_c - src_c
-                d_xy_ego = R_ego.T @ delta[:2]
-                angle = float(np.arctan2(d_xy_ego[1], d_xy_ego[0]))
-                obj_dir = self._quantize_8_way(angle)
-                elev = self._elev_relation(float(delta[2]))
-
-                object_relations.append(
-                    {
-                        "src": src,
-                        "dst": dst,
-                        "dir": obj_dir,
-                        "elev": elev,
-                        "dist_m": float(dist),
-                    }
-                )
-
-        object_relations.sort(key=lambda x: (x["dist_m"], x["src"], x["dst"]))
-        object_relations = object_relations[: self.config.serialization.max_obj_relations]
-
-        return ego_relations, object_relations
-
-    def _infer_motion(self, track: _TrackState) -> str:
-        window = max(2, self.config.edge.motion_window)
-        samples = track.motion_samples[-window:]
-        # Cold start: need at least motion_window samples (spec §7)
-        if len(samples) < window:
-            return "unknown"
-
-        t0, d0, l0 = samples[0]
-        t1, d1, l1 = samples[-1]
-        # Normalize by frame gap so sparse (e.g., 10Hz) sampling preserves motion magnitude.
-        dt = max(1, t1 - t0)
-
-        rate = (d1 - d0) / dt
-        lateral_rate = abs(l1 - l0) / dt
-
-        if rate < -self.config.edge.motion_thresh:
-            return "approaching"
-        if rate > self.config.edge.motion_thresh:
-            return "receding"
-        if lateral_rate > self.config.edge.lateral_thresh:
-            return "lateral"
-        return "static"
-
-    def _step_to_json(self, frame_idx: int, step: STEPToken) -> Dict[str, object]:
         return {
             "t": frame_idx,
-            "tau": [
-                {"row": int(p.row), "col": int(p.col), "iou": float(p.iou)}
-                for p in step.patch_tokens
-            ],
+            "tau": tau_list,
             "c": [
                 float(step.centroid.x),
                 float(step.centroid.y),
@@ -626,34 +535,6 @@ class FastSNOWPipeline:
         if union == 0:
             return 0.0
         return float(inter / union)
-
-    def _elev_relation(self, dz: float) -> str:
-        if dz > self.config.edge.elev_thresh:
-            return "above"
-        if dz < -self.config.edge.elev_thresh:
-            return "below"
-        return "level"
-
-    @staticmethod
-    def _quantize_8_way(angle_rad: float) -> str:
-        # Angle is in ego frame where 0 points to "front".
-        deg = math.degrees(angle_rad)
-        if -22.5 <= deg < 22.5:
-            return "front"
-        if 22.5 <= deg < 67.5:
-            return "front-left"
-        if 67.5 <= deg < 112.5:
-            return "left"
-        if 112.5 <= deg < 157.5:
-            return "back-left"
-        if deg >= 157.5 or deg < -157.5:
-            return "back"
-        if -157.5 <= deg < -112.5:
-            return "back-right"
-        if -112.5 <= deg < -67.5:
-            return "right"
-        return "front-right"
-
 
 __all__ = [
     "FastSNOWPipeline",

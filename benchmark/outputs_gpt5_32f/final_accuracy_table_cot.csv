@@ -1,0 +1,2 @@
+Model (JSON File),Real Ego-centric Accuracy (%),Real Exo-centric Accuracy (%),Real Overall Accuracy (%),Synthetic Directional Accuracy (%),Synthetic FP Accuracy (%),Synthetic Overall Accuracy (%),Overall Accuracy (%)
+gpt-5.2_32frame.json,75.95,72.45,73.6,68.75,64.44,68.31,72.3

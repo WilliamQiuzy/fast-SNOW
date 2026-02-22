@@ -1,0 +1,8 @@
+
+Evaluating output directory: ../outputs_gpt5_10hz_full/real_mc_cot
+==================================================
+Accuracy of gpt-5.2_10hz.json: 0.725018234865062
+
+Evaluating output directory: ../outputs_gpt5_10hz_full/synthetic_mc_cot
+==================================================
+Accuracy of gpt-5.2_10hz.json: 0.6696629213483146

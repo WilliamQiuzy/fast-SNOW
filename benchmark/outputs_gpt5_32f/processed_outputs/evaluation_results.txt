@@ -1,0 +1,11 @@
+
+Evaluating output directory: ../outputs_gpt5_32f/real_mc_cot
+==================================================
+
+Evaluating output directory: ../outputs_gpt5_32f/real_mc_cot
+==================================================
+Accuracy of gpt-5.2_32frame.json: 0.7359591539022611
+
+Evaluating output directory: ../outputs_gpt5_32f/synthetic_mc_cot
+==================================================
+Accuracy of gpt-5.2_32frame.json: 0.6831460674157304

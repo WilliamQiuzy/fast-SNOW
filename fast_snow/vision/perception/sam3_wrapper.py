@@ -97,6 +97,9 @@ class SAM3RunManager:
         self._predictor.model.score_threshold_detection = (
             self.config.score_threshold_detection
         )
+        self._predictor.model.trim_past_non_cond_mem_for_eval = (
+            self.config.trim_past_non_cond_mem_for_eval
+        )
 
         logger.info(
             "SAM3 predictor loaded from %s (score_thresh=%.2f)",
@@ -167,6 +170,8 @@ class SAM3RunManager:
 
         result = self._predictor.start_session(
             resource_path=str(self._video_dir),
+            offload_state_to_cpu=self.config.offload_state_to_cpu,
+            offload_video_to_cpu=self.config.offload_video_to_cpu,
         )
         run.session_id = result["session_id"]
 
@@ -203,7 +208,11 @@ class SAM3RunManager:
         if self._video_dir is None:
             raise RuntimeError("Call set_video_dir() before create_run_with_initial_masks()")
 
-        session = self._predictor.start_session(resource_path=str(self._video_dir))
+        session = self._predictor.start_session(
+            resource_path=str(self._video_dir),
+            offload_state_to_cpu=self.config.offload_state_to_cpu,
+            offload_video_to_cpu=self.config.offload_video_to_cpu,
+        )
         run.session_id = session["session_id"]
 
         prompt_result = self._predictor.add_prompt(
@@ -219,6 +228,57 @@ class SAM3RunManager:
         self._runs[run_id] = run
         logger.debug(
             "Created SAM3 run %d with %d initial masks for tag '%s' at frame %d",
+            run_id,
+            len(initial_masks),
+            tag,
+            frame_idx,
+        )
+        return run, initial_masks
+
+    def create_run_with_initial_boxes(
+        self,
+        box_xywh: List[float],
+        frame_idx: int,
+        tag: str = "box",
+        box_label: int = 1,
+    ) -> Tuple[SAM3Run, List[SAM3Mask]]:
+        """Create a run with a single box visual prompt and return initial masks."""
+        self.load()
+
+        run_id = self._next_run_id
+        self._next_run_id += 1
+
+        run = SAM3Run(
+            run_id=run_id,
+            tag=tag,
+            start_frame=frame_idx,
+        )
+
+        if self._video_dir is None:
+            raise RuntimeError("Call set_video_dir() before create_run_with_initial_boxes()")
+
+        session = self._predictor.start_session(
+            resource_path=str(self._video_dir),
+            offload_state_to_cpu=self.config.offload_state_to_cpu,
+            offload_video_to_cpu=self.config.offload_video_to_cpu,
+        )
+        run.session_id = session["session_id"]
+
+        prompt_result = self._predictor.add_prompt(
+            session_id=run.session_id,
+            frame_idx=frame_idx,
+            text="visual",
+            bounding_boxes=[box_xywh],
+            bounding_box_labels=[box_label],
+        )
+        outputs = prompt_result.get("outputs", {})
+        initial_masks = self._outputs_to_masks(run.run_id, outputs)
+
+        run.last_propagated_frame = frame_idx
+        run.status = "active"
+        self._runs[run_id] = run
+        logger.debug(
+            "Created SAM3 run %d with %d initial masks for box '%s' at frame %d",
             run_id,
             len(initial_masks),
             tag,
@@ -260,12 +320,21 @@ class SAM3RunManager:
                 ):
                     fid = int(out.get("frame_index", -1))
                     outputs = out.get("outputs", {})
-                    run.last_propagated_frame = max(run.last_propagated_frame, fid)
+                    # only advance to the requested frame; SAM3 may return one
+                    # extra frame due to tracking-order semantics.
+                    if fid <= frame_idx:
+                        run.last_propagated_frame = max(run.last_propagated_frame, fid)
                     if fid != frame_idx:
                         continue
                     all_masks.extend(self._outputs_to_masks(run.run_id, outputs))
             except Exception as e:
                 logger.warning("SAM3 propagation failed for run %d: %s", run.run_id, e)
+                try:
+                    self._predictor.close_session(run.session_id)
+                except Exception:
+                    pass
+                run.session_id = None
+                run.status = "ended"
 
         return all_masks
 
@@ -289,6 +358,20 @@ class SAM3RunManager:
     @property
     def active_runs(self) -> List[SAM3Run]:
         return [r for r in self._runs.values() if r.status == "active"]
+
+    def debug_runs(self) -> List[Dict[str, object]]:
+        """Return lightweight run diagnostics for logging and troubleshooting."""
+        return [
+            {
+                "run_id": run.run_id,
+                "tag": run.tag,
+                "status": run.status,
+                "start_frame": run.start_frame,
+                "last_propagated_frame": run.last_propagated_frame,
+                "has_session": run.session_id is not None,
+            }
+            for run in self._runs.values()
+        ]
 
     def _outputs_to_masks(self, run_id: int, outputs: Dict[str, np.ndarray]) -> List[SAM3Mask]:
         """Convert raw SAM3 outputs to filtered SAM3Mask list."""

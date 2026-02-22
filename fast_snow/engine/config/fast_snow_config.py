@@ -30,6 +30,9 @@ class SAM3Config:
     """
     score_threshold_detection: float = 0.3
     model_path: str = "fast_snow/models/sam3"
+    trim_past_non_cond_mem_for_eval: bool = True
+    offload_state_to_cpu: bool = True
+    offload_video_to_cpu: bool = True
 
 
 @dataclass
@@ -37,13 +40,31 @@ class DA3Config:
     """DA3 monocular depth estimation configuration (Step 2).
 
     model_path: local directory or HF hub ID passed to
-        ``DepthAnything3.from_pretrained()``.  Must point to a **metric**
-        model (e.g. da3nested-giant-large) so that depth is in metres.
+        ``DepthAnything3.from_pretrained()``.
+
+    Supported model variants (smallest → largest):
+      - ``da3-small``   (~34M)  — relative depth + K + T_wc
+      - ``da3-base``    (~120M) — relative depth + K + T_wc
+      - ``da3-large``   (~350M) — relative depth + K + T_wc
+      - ``da3nested-giant-large`` (~1.4B) — metric depth + K + T_wc
+
+    When ``require_metric`` is False (default), relative-depth models are
+    accepted and 3D coordinates use an arbitrary but consistent scale.
+    Set ``require_metric=True`` to enforce metric depth in metres.
+
+    Chunked inference (see docs/bugs/DA3_BATCH_OOM.md):
+      When ``chunk_size > 0`` and the frame count exceeds ``chunk_size``,
+      ``infer_batch`` automatically splits into overlapping chunks and
+      aligns them via SIM3 point-cloud matching.  Set ``chunk_size=0``
+      to disable chunking (always full-batch).
     """
     device: str = "cuda"
-    model_path: str = "fast_snow/models/da3"
+    model_path: str = "fast_snow/models/da3-small"
     process_res: int = 504
     process_res_method: str = "upper_bound_resize"
+    require_metric: bool = False
+    chunk_size: int = 0    # Max frames per DA3 batch chunk. 0 = no chunking.
+    chunk_overlap: int = 5  # Overlap frames between adjacent chunks for SIM3 alignment.
 
 
 @dataclass
@@ -54,6 +75,33 @@ class RAMPlusConfig:
     checkpoint_path: Optional[str] = None  # Explicit .pth path; auto-detect if None
     normalize_lowercase: bool = True
     deduplicate_tags: bool = True
+
+
+@dataclass
+class YOLOConfig:
+    """YOLO bbox detection configuration (legacy, used by asset scripts)."""
+    device: str = "cuda"
+    model_path: str = "yolo11n.pt"
+    conf_threshold: float = 0.25
+    iou_threshold: float = 0.7
+    imgsz: int = 640
+    max_det: int = 200
+
+
+@dataclass
+class FastSAMConfig:
+    """FastSAM class-agnostic segmentation configuration (Step 1).
+
+    Replaces YOLO for initial object discovery.  FastSAM produces
+    instance masks without class labels, enabling open-world detection.
+    """
+    device: str = "cuda"
+    model_path: str = "fast_snow/models/fastsam/FastSAM-s.pt"
+    conf_threshold: float = 0.55
+    iou_threshold: float = 0.9
+    imgsz: int = 640
+    max_det: int = 200
+    discovery_iou_thresh: float = 0.3  # Below this IoU = new object in two-pass discovery
 
 
 @dataclass
@@ -90,22 +138,28 @@ class STEPConfig:
     """STEP token configuration (Step 6, spec Section 6.4)."""
     grid_size: int = 16
     iou_threshold: float = 0.5
+    mask_outside_pixels: bool = True  # Zero out non-mask pixels in patch crops (paper default)
+    patch_crop_size: int = 64  # Resize each cell crop to 64x64 for uniform visual tokens
+    temporal_window: int = 10  # F_k sliding window: keep last T frames per track (SNOW §4.2, T=10)
+    max_tau_per_step: int = 0  # Top-k patches per STEP token, sorted by IoU desc. 0=unlimited.
 
 
 @dataclass
-class EdgeConfig:
-    """Scene graph edge configuration (Step 7, spec Section 6.5)."""
-    elev_thresh: float = 0.5   # meters
-    motion_thresh: float = 0.3  # m/frame
-    lateral_thresh: float = 0.3  # m/frame
-    knn_k: int = 3
-    motion_window: int = 3  # frames — minimum history for motion inference
+class VLMConfig:
+    """VLM inference configuration (Step 9).
 
+    Supports two providers:
+    - "openai": Uses OpenAI API (default, for GPT-5.2 etc.)
+    - "google": Uses Google genai API (for Gemini, Gemma etc.)
 
-@dataclass
-class SerializationConfig:
-    """Serialization & VLM configuration (Step 8, spec Section 6.6)."""
-    max_obj_relations: int = 20
+    The API key is read from the environment variable specified by api_key_env.
+    """
+    provider: str = "openai"          # "openai" | "google"
+    model: str = "gpt-5.2"            # Model name sent to API
+    max_output_tokens: int = 1024
+    temperature: float = 1.0
+    api_key_env: str = "OPENAI_API_KEY"  # Env var name for the API key
+    base_url: Optional[str] = None       # Optional base URL override (e.g. for Gemini via OpenAI-compat)
 
 
 # =============================================================================
@@ -122,6 +176,7 @@ class FastSNOWConfig:
     # Vision models
     sam3: SAM3Config = field(default_factory=SAM3Config)
     da3: DA3Config = field(default_factory=DA3Config)
+    fastsam: FastSAMConfig = field(default_factory=FastSAMConfig)
     ram_plus: RAMPlusConfig = field(default_factory=RAMPlusConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
 
@@ -129,8 +184,7 @@ class FastSNOWConfig:
     depth_filter: DepthFilterConfig = field(default_factory=DepthFilterConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     step: STEPConfig = field(default_factory=STEPConfig)
-    edge: EdgeConfig = field(default_factory=EdgeConfig)
-    serialization: SerializationConfig = field(default_factory=SerializationConfig)
+    vlm: VLMConfig = field(default_factory=VLMConfig)
 
     # Global settings
     device: str = "cuda"
